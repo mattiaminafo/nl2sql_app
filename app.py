@@ -1,4 +1,3 @@
-````python
 import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
@@ -236,4 +235,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-````
+
