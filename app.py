@@ -115,53 +115,59 @@ class NL2SQLQueryEngine:
             logger.error(f"Error executing query: {e}")
             return None, f"Errore esecuzione query: {e}"
 
-    def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
+        def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
+        """Convert query results to natural language response, support top-N lists."""
         if df is None or df.empty:
             return "Nessun risultato trovato."
+        
         q = original_query.lower()
 
-        # single-value
+        # 1) Single-value (COUNT, SUM, AVG, ecc.)
         if len(df.columns) == 1 and len(df) == 1:
             col = df.columns[0]
             val = df.iloc[0, 0]
-            if any(k in col.lower() for k in ["count", "total"]):
+            if any(k in col.lower() for k in ("count", "total")):
                 return f"The result is {val:,.0f}"
-            if any(k in col.lower() for k in ["avg", "average"]):
+            if any(k in col.lower() for k in ("avg", "average")):
                 return f"The average value is {val:,.2f}"
             return f"The result is {val}"
 
-        # two-column results: support top-N lists
+        # 2) Two-column outputs (city + count, country + sum, ecc.)
         if len(df.columns) == 2:
             c1, c2 = df.columns
-            m = re.search(r'(\d+)\s+cities?', q)
+            # se nella query c'è “top N cities”
+            m = re.search(r"top\s+(\d+)\s+cities?", q)
             if m:
                 n = int(m.group(1))
                 lines = [f"Top {n} cities by {c2}:"]
-                for i, row in enumerate(df.head(n).itertuples(index=False), start=1):
-                    lines.append(f"{i}. {getattr(row, c1)} with {getattr(row, c2):,.0f} orders")
+                topn = df.head(n)
+                for idx, row in topn.iterrows():
+                    lines.append(f"{idx+1}. {row[c1]} with {row[c2]:,.0f} orders")
                 return "\n".join(lines)
+            # altrimenti se menziona city, prendi solo il primo
             if "city" in q:
                 top = df.iloc[0]
                 return f"The city with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
+            # fallback generico
             top = df.iloc[0]
             return f"The top result is {top[c1]} with {top[c2]}"
 
-        # distribution chart
-        if any(k in q for k in ["distribution", "histogram", "spread"]):
+        # 3) Distribuzione (bar chart)
+        if any(k in q for k in ("distribution", "histogram", "spread")):
             col = df.columns[0]
             counts = df[col].value_counts().head(10)
             st.bar_chart(counts)
-            return f"Showing distribution of {col} (top 10 categories)."
+            return f"Showing distribution of {col} (top 10)."
 
-        # correlation table
+        # 4) Correlazione
         if "correlation" in q:
             corr = df.corr()
             st.dataframe(corr)
             return "Correlation matrix displayed."
 
-        # forecast
-        if any(k in q for k in ["forecast", "predict", "trend", "next", "future"]):
-            # assume first col is date, second is value
+        # 5) Previsione (forecast)
+        if any(k in q for k in ("forecast", "predict", "trend", "next", "future")):
+            # assumiamo col1 = date, col2 = valore
             ds = pd.to_datetime(df.iloc[:, 0])
             y = df.iloc[:, 1]
             df_prophet = pd.DataFrame({"ds": ds, "y": y})
@@ -172,15 +178,16 @@ class NL2SQLQueryEngine:
             st.line_chart(fcst.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])
             return "Forecast for next 30 periods displayed."
 
-        # up to 5 rows list
+        # 6) Fino a 5 righe: elenca
         if len(df) <= 5:
             text = "Here are the results:\n"
             for _, row in df.iterrows():
                 text += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
             return text
 
-        # fallback: show count and head
+        # 7) Fallback generico: numero di righe + top 5
         return f"Found {len(df)} results. Here are the top 5:\n" + df.head().to_string(index=False)
+
 
 def main():
     st.title("🔍 Natural Language to SQL Query Interface")
