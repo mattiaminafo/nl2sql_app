@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from openai import OpenAI
 import openai
 import json
 import re
@@ -53,39 +54,39 @@ class NL2SQLQueryEngine:
         try:
             # ——————————— BigQuery ———————————
             if "gcp_service_account" in st.secrets:
-                credentials = service_account.Credentials.from_service_account_info(
+                creds = service_account.Credentials.from_service_account_info(
                     st.secrets["gcp_service_account"]
                 )
-                self.bq_client = bigquery.Client(credentials=credentials)
+                self.bq_client = bigquery.Client(credentials=creds)
             elif "project_id" in st.secrets:
                 self.bq_client = bigquery.Client(project=st.secrets["project_id"])
             else:
                 self.bq_client = bigquery.Client(project="planar-flux-465609-e1")
-            
+
             # ——————————— OpenAI ———————————
             if "openai_api_key" in st.secrets:
-                openai.api_key = st.secrets["openai_api_key"]
+                # istanzia il nuovo client OpenAI
+                self.openai_client = OpenAI(api_key=st.secrets["openai_api_key"])
             else:
                 st.error("OpenAI API key not found in secrets")
                 return
-                
+
         except Exception as e:
             logger.error(f"Error setting up clients: {e}")
             st.error(f"Error setting up clients: {e}")
     
     def generate_sql_from_nl(self, natural_language_query):
         """Convert natural language to SQL using OpenAI"""
-        schema_description = "\n".join([
-            f"- {col['name']} ({col['type']}): {col['description']}"
-            for col in self.table_schema
-        ])
-        
+        schema_desc = "\n".join(
+            f"- {c['name']} ({c['type']}): {c['description']}"
+            for c in self.table_schema
+        )
         prompt = f"""
 You are a SQL expert. Convert the following natural language query to a valid BigQuery SQL query.
 
 Table: {self.dataset_name}
 Schema:
-{schema_description}
+{schema_desc}
 
 Rules:
 1. Use only the columns from the schema above
@@ -101,21 +102,19 @@ Natural Language Query: {natural_language_query}
 SQL Query:
 """
         try:
-            response = openai.ChatCompletion.create(
+            resp = self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You are a SQL expert that converts natural language to BigQuery SQL."},
-                    {"role": "user", "content": prompt}
+                    {"role": "user",   "content": prompt}
                 ],
                 max_tokens=500,
                 temperature=0.1
             )
-            
-            sql_query = response.choices[0].message.content.strip()
-            # Rimuovi eventuali backticks
-            sql_query = re.sub(r'```(?:sql)?\n?', '', sql_query).strip()
-            return sql_query
-            
+            sql = resp.choices[0].message.content
+            # rimuovi eventuali ```sql o ```
+            sql = re.sub(r'```(?:sql)?\n?', '', sql).strip()
+            return sql
         except Exception as e:
             logger.error(f"Error generating SQL: {e}")
             st.error(f"OpenAI API Error: {e}")
@@ -124,18 +123,13 @@ SQL Query:
     def execute_sql_query(self, sql_query):
         """Execute SQL query on BigQuery"""
         try:
-            # Validate query references the corretto dataset
             if self.dataset_name not in sql_query:
                 return None, "Query must reference the correct dataset table"
-            
-            query_job = self.bq_client.query(sql_query)
-            results = query_job.result()
-            df = results.to_dataframe()
-            
+            job = self.bq_client.query(sql_query)
+            df = job.result().to_dataframe()
             if df.empty:
                 return df, "No results found for your query"
             return df, None
-            
         except Exception as e:
             logger.error(f"Error executing query: {e}")
             return None, f"Error executing query: {e}"
@@ -144,9 +138,8 @@ SQL Query:
         """Convert query results to natural language response"""
         if df is None or df.empty:
             return "No results found for your query."
-        
         try:
-            # Single value
+            # caso single-value
             if len(df.columns) == 1 and len(df) == 1:
                 col = df.columns[0]
                 val = df.iloc[0, 0]
@@ -155,41 +148,36 @@ SQL Query:
                 if "avg" in col.lower() or "average" in col.lower():
                     return f"The average value is {val:,.2f}"
                 return f"The result is {val}"
-            
-            # Two columns, multiple rows
-            if len(df.columns) == 2 and len(df) >= 1:
-                col1, col2 = df.columns
+            # caso top-2 colonne
+            if len(df.columns) == 2:
+                c1, c2 = df.columns
                 top = df.iloc[0]
                 q = original_query.lower()
                 if "city" in q:
-                    return f"The city with the most orders is {top[col1]} with {top[col2]:,.0f} orders"
+                    return f"The city with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
                 if "country" in q:
-                    return f"The country with the highest value is {top[col1]} with {top[col2]:,.2f}"
+                    return f"The country with the highest value is {top[c1]} with {top[c2]:,.2f}"
                 if "channel" in q:
-                    return f"The channel with the most orders is {top[col1]} with {top[col2]:,.0f} orders"
-                return f"The top result is {top[col1]} with {top[col2]}"
-            
-            # Multiple columns or rows
+                    return f"The channel with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
+                return f"The top result is {top[c1]} with {top[c2]}"
+            # caso multi-riga
             if len(df) <= 5:
-                text = "Here are the results:\n"
+                txt = "Here are the results:\n"
                 for _, row in df.iterrows():
-                    text += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
-                return text
-            return f"Found {len(df)} results. Here are the top 5:\n" + df.head().to_string(index=False)
-        
+                    txt += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
+                return txt
+            return f"Found {len(df)} results. Top 5:\n" + df.head().to_string(index=False)
         except Exception as e:
-            logger.error(f"Error formatting: {e}")
+            logger.error(f"Error formatting results: {e}")
             return f"Results found but formatting error: {e}"
 
 def main():
     st.title("🔍 Natural Language to SQL Query Interface")
     st.markdown("Ask questions about your brand orders data in plain English!")
     
-    # Initialize query engine
     if 'query_engine' not in st.session_state:
         st.session_state.query_engine = NL2SQLQueryEngine()
     
-    # Sidebar with examples
     with st.sidebar:
         st.header("📝 Example Questions")
         st.markdown("""
@@ -205,7 +193,6 @@ def main():
             for i, q in enumerate(st.session_state.query_history[-5:]):
                 st.text(f"{i+1}. {q[:50]}...")
     
-    # Main columns
     col1, col2 = st.columns([3, 1])
     with col1:
         user_query = st.text_input(
@@ -219,19 +206,19 @@ def main():
         st.session_state.query_history.append(user_query)
         with st.spinner("Processing your question..."):
             st.info("🤖 Converting your question to SQL...")
-            sql_query = st.session_state.query_engine.generate_sql_from_nl(user_query)
-            if sql_query:
+            sql = st.session_state.query_engine.generate_sql_from_nl(user_query)
+            if sql:
                 with st.expander("Generated SQL Query"):
-                    st.code(sql_query, language="sql")
+                    st.code(sql, language="sql")
                 st.info("🔍 Executing query on BigQuery...")
-                df, error = st.session_state.query_engine.execute_sql_query(sql_query)
-                if error:
-                    st.error(f"Query Error: {error}")
+                df, err = st.session_state.query_engine.execute_sql_query(sql)
+                if err:
+                    st.error(f"Query Error: {err}")
                 else:
-                    response = st.session_state.query_engine.format_results_to_natural_language(df, user_query)
+                    resp = st.session_state.query_engine.format_results_to_natural_language(df, user_query)
                     st.success("✅ Query executed successfully!")
                     st.markdown("### 📊 Answer:")
-                    st.markdown(f"**{response}**")
+                    st.markdown(f"**{resp}**")
                     if st.checkbox("Show raw data"):
                         st.dataframe(df)
             else:
