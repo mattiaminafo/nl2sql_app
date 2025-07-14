@@ -1,3 +1,4 @@
+````python
 # app.py
 import streamlit as st
 import pandas as pd
@@ -52,19 +53,22 @@ class NL2SQLQueryEngine:
         """Initialize BigQuery and OpenAI clients"""
         # ——————————— BigQuery ———————————
         try:
+            project = st.secrets.get("project_id", "planar-flux-465609-e1")
             if "gcp_service_account" in st.secrets:
                 creds = service_account.Credentials.from_service_account_info(
                     st.secrets["gcp_service_account"]
                 )
-                self.bq_client = bigquery.Client(credentials=creds)
-            elif "project_id" in st.secrets:
-                self.bq_client = bigquery.Client(project=st.secrets["project_id"])
+                self.bq_client = bigquery.Client(
+                    project=project,
+                    credentials=creds
+                )
             else:
-                self.bq_client = bigquery.Client(project="planar-flux-465609-e1")
+                # Fallback to ADC or project-only
+                self.bq_client = bigquery.Client(project=project)
         except Exception as e:
             logger.error(f"BigQuery init error: {e}")
             st.error("Errore di configurazione BigQuery, controlla secrets.")
-        
+
         # ——————————— OpenAI ———————————
         try:
             if "openai_api_key" in st.secrets:
@@ -143,8 +147,38 @@ SQL Query:
         """Convert query results to natural language response"""
         if df is None or df.empty:
             return "Nessun risultato trovato."
-        # (implementazione identica a prima…)
-        # …omessa per brevità, usa quella del tuo codice
+        
+        # single-value
+        if len(df.columns) == 1 and len(df) == 1:
+            col = df.columns[0]
+            val = df.iloc[0, 0]
+            if "count" in col.lower() or "total" in col.lower():
+                return f"The result is {val:,.0f}"
+            if "avg" in col.lower() or "average" in col.lower():
+                return f"The average value is {val:,.2f}"
+            return f"The result is {val}"
+        
+        # two-column top result
+        if len(df.columns) == 2:
+            c1, c2 = df.columns
+            top = df.iloc[0]
+            q = original_query.lower()
+            if "city" in q:
+                return f"The city with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
+            if "country" in q:
+                return f"The country with the highest value is {top[c1]} with {top[c2]:,.2f}"
+            if "channel" in q:
+                return f"The channel with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
+            return f"The top result is {top[c1]} with {top[c2]}"
+        
+        # multiple rows
+        if len(df) <= 5:
+            text = "Here are the results:\n"
+            for _, row in df.iterrows():
+                text += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
+            return text
+        
+        return f"Found {len(df)} results. Here are the top 5:\n" + df.head().to_string(index=False)
 
 def main():
     st.title("🔍 Natural Language to SQL Query Interface")
@@ -204,3 +238,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+````
