@@ -5,9 +5,9 @@ from google.oauth2 import service_account
 from openai import OpenAI
 import re
 import logging
-from prophet import Prophet    # in requirements.txt: prophet>=1.0
+from prophet import Prophet    # Assicurati di avere prophet in requirements.txt
 
-# logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,35 +24,29 @@ class NL2AnalyticsEngine:
         self._setup_clients()
 
     def _setup_clients(self):
-        # BigQuery
         project = st.secrets["project_id"]
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
         )
         self.bq = bigquery.Client(project=project, credentials=creds)
-        # OpenAI
         self.oa = OpenAI(api_key=st.secrets["openai_api_key"])
 
     def classify_request(self, nl: str) -> str:
-        """Chiede al modello di classificare il tipo di analisi."""
         sys = (
             "You are an analytics assistant. "
-            "Classify the user's natural language request into one of: "
-            "top_n, distribution, correlation, forecast, raw, summary."
+            "Classify the user's request into one of: top_n, distribution, correlation, forecast, raw, summary."
         )
-        usr = f"Request: \"{nl}\""
         resp = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role":"system","content":sys},
-                {"role":"user","content":usr}
+                {"role":"user","content":f"Request: \"{nl}\""}
             ],
             temperature=0
         )
         return resp.choices[0].message.content.strip().lower()
 
     def generate_sql(self, nl: str) -> str:
-        """Genera la SQL via OpenAI."""
         prompt = (
             f"You are a BigQuery SQL expert. Given the request:\n\"{nl}\"\n"
             f"Generate only the SQL (no explanation) on table `{self.dataset}`."
@@ -69,23 +63,24 @@ class NL2AnalyticsEngine:
         return re.sub(r'```.*?\n|```', '', sql).strip()
 
     def run(self, user_query: str):
-        # 1) classify
         analysis = self.classify_request(user_query)
-        # 2) generate SQL
         sql = self.generate_sql(user_query)
-        st.code(sql, language="sql", label="Generated SQL")
-        # 3) execute
+
+        # Show SQL
+        st.markdown("### Generated SQL Query")
+        st.code(sql, language="sql")
+
+        # Execute
         df = self.bq.query(sql).result().to_dataframe()
         if df.empty:
             st.warning("Nessun risultato.")
             return
 
-        # 4) dispatch
+        # Dispatch based on classification
         if analysis == "top_n":
-            # assume two cols: entity + metric
             c1, c2 = df.columns[:2]
             lines = [f"Top results by {c2}:"]
-            for i,row in df.iterrows():
+            for i, row in df.iterrows():
                 lines.append(f"{i+1}. {row[c1]} → {row[c2]:,.0f}")
             st.markdown("\n".join(lines))
 
@@ -97,9 +92,9 @@ class NL2AnalyticsEngine:
             st.dataframe(df.corr())
 
         elif analysis == "forecast":
-            # time series: date + value
-            df_ts = pd.DataFrame({"ds":pd.to_datetime(df.iloc[:,0]), "y":df.iloc[:,1]})
-            m = Prophet(); m.fit(df_ts)
+            df_ts = pd.DataFrame({"ds": pd.to_datetime(df.iloc[:,0]), "y": df.iloc[:,1]})
+            m = Prophet()
+            m.fit(df_ts)
             future = m.make_future_dataframe(periods=30)
             fc = m.predict(future)
             st.line_chart(fc.set_index("ds")[["yhat","yhat_lower","yhat_upper"]])
@@ -121,9 +116,9 @@ def main():
             engine.run(qu)
 
     if st.session_state.query_history:
-        st.sidebar.header("Recent")
+        st.sidebar.header("Recent Queries")
         for q in st.session_state.query_history[-5:]:
             st.sidebar.write(q)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
