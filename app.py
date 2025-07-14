@@ -89,10 +89,11 @@ class NL2AnalyticsEngine:
             if m:
                 bad_col = m.group(1)
                 col_map = {
-                    "total_amount": "total_eur",
-                    "amount": "total_eur",
-                    "spend": "total_eur",
-                    "price": "total_eur"
+                      "total_amount": "total_eur",
+    "amount":       "total_eur",
+    "spend":        "total_eur",
+    "price":        "total_eur",
++   "user_id":      "customer_id",   
                 }
                 if bad_col in col_map:
                     corrected = col_map[bad_col]
