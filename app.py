@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.api_core.exceptions import BadRequest
 from openai import OpenAI
 import re
 import logging
-from prophet import Prophet    # Assicurati di avere prophet in requirements.txt
+from prophet import Prophet    # assicurati di aggiungere "prophet>=1.0" a requirements.txt
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,101 +25,129 @@ class NL2AnalyticsEngine:
         self._setup_clients()
 
     def _setup_clients(self):
+        # BigQuery client
         project = st.secrets["project_id"]
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
         )
         self.bq = bigquery.Client(project=project, credentials=creds)
+        # OpenAI client
         self.oa = OpenAI(api_key=st.secrets["openai_api_key"])
 
     def classify_request(self, nl: str) -> str:
-        sys = (
+        """Classify the request type for dispatching."""
+        system_prompt = (
             "You are an analytics assistant. "
-            "Classify the user's request into one of: top_n, distribution, correlation, forecast, raw, summary."
+            "Classify the user's request into exactly one of: "
+            "top_n, distribution, correlation, forecast, raw, summary."
         )
-        resp = self.oa.chat.completions.create(
+        response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role":"system","content":sys},
-                {"role":"user","content":f"Request: \"{nl}\""}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Request: \"{nl}\""}
             ],
             temperature=0
         )
-        return resp.choices[0].message.content.strip().lower()
+        return response.choices[0].message.content.strip().lower()
 
     def generate_sql(self, nl: str) -> str:
+        """Generate a BigQuery SQL query from natural language."""
         prompt = (
             f"You are a BigQuery SQL expert. Given the request:\n\"{nl}\"\n"
-            f"Generate only the SQL (no explanation) on table `{self.dataset}`."
+            f"Generate only the SQL (no explanations) on table `{self.dataset}`."
         )
-        resp = self.oa.chat.completions.create(
+        response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role":"system","content":"SQL expert"},
-                {"role":"user","content":prompt}
+                {"role": "system", "content": "SQL expert"},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.1
         )
-        sql = resp.choices[0].message.content
+        sql = response.choices[0].message.content
+        # Strip any ``` fences
         return re.sub(r'```.*?\n|```', '', sql).strip()
 
     def run(self, user_query: str):
+        # 1) classify
         analysis = self.classify_request(user_query)
+        # 2) generate SQL
         sql = self.generate_sql(user_query)
 
-        # Show SQL
+        # Display generated SQL
         st.markdown("### Generated SQL Query")
         st.code(sql, language="sql")
 
-        # Execute
-        df = self.bq.query(sql).result().to_dataframe()
+        # 3) execute SQL with error handling
+        try:
+            job = self.bq.query(sql)
+            df = job.result().to_dataframe()
+        except BadRequest as e:
+            st.error(f"Errore SQL: {e.message}")
+            return
+        except Exception as e:
+            st.error(f"Errore esecuzione query: {e}")
+            return
+
         if df.empty:
             st.warning("Nessun risultato.")
             return
 
-        # Dispatch based on classification
+        # 4) dispatch based on classification
         if analysis == "top_n":
+            # assume two columns: label + metric
             c1, c2 = df.columns[:2]
             lines = [f"Top results by {c2}:"]
-            for i, row in df.iterrows():
-                lines.append(f"{i+1}. {row[c1]} → {row[c2]:,.0f}")
+            for idx, row in df.iterrows():
+                lines.append(f"{idx+1}. {row[c1]} → {row[c2]:,.0f}")
             st.markdown("\n".join(lines))
 
         elif analysis == "distribution":
             col = df.columns[0]
-            st.bar_chart(df[col].value_counts().head(10))
+            counts = df[col].value_counts().head(10)
+            st.bar_chart(counts)
+            st.markdown(f"Distribution of **{col}** (top 10 categories)")
 
         elif analysis == "correlation":
-            st.dataframe(df.corr())
+            corr = df.corr()
+            st.markdown("### Correlation Matrix")
+            st.dataframe(corr)
 
         elif analysis == "forecast":
-            df_ts = pd.DataFrame({"ds": pd.to_datetime(df.iloc[:,0]), "y": df.iloc[:,1]})
-            m = Prophet()
-            m.fit(df_ts)
-            future = m.make_future_dataframe(periods=30)
-            fc = m.predict(future)
-            st.line_chart(fc.set_index("ds")[["yhat","yhat_lower","yhat_upper"]])
+            # assume first column is date, second is numeric
+            ds = pd.to_datetime(df.iloc[:, 0])
+            y = df.iloc[:, 1]
+            df_ts = pd.DataFrame({"ds": ds, "y": y})
+            model = Prophet()
+            model.fit(df_ts)
+            future = model.make_future_dataframe(periods=30)
+            forecast = model.predict(future)
+            st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])
+            st.markdown("Forecast for next 30 periods")
 
         elif analysis == "raw":
+            st.markdown("### Raw Data")
             st.dataframe(df)
 
         else:  # summary
+            st.markdown("### Summary (top 5 rows)")
             st.table(df.head(5))
-            st.markdown(f"Found **{len(df)}** rows. Showing top 5.")
+            st.markdown(f"Found **{len(df)}** rows total.")
 
 def main():
     st.title("🔍 Natural Language Analytics Interface")
-    qu = st.text_input("Ask anything (analytics/statistics/forecast)...")
+    user_query = st.text_input("Ask anything (analytics/statistics/forecast)...")
     if st.button("Run"):
-        st.session_state.query_history.append(qu)
-        with st.spinner("Thinking…"):
+        st.session_state.query_history.append(user_query)
+        with st.spinner("Processing your request…"):
             engine = NL2AnalyticsEngine()
-            engine.run(qu)
+            engine.run(user_query)
 
     if st.session_state.query_history:
         st.sidebar.header("Recent Queries")
         for q in st.session_state.query_history[-5:]:
-            st.sidebar.write(q)
+            st.sidebar.write(f"- {q}")
 
 if __name__ == "__main__":
     main()
