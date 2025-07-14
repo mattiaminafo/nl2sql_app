@@ -66,7 +66,6 @@ class NL2AnalyticsEngine:
             temperature=0.1
         )
         sql = response.choices[0].message.content
-        # Strip any ``` fences
         return re.sub(r'```.*?\n|```', '', sql).strip()
 
     def run(self, user_query: str):
@@ -79,24 +78,50 @@ class NL2AnalyticsEngine:
         st.markdown("### Generated SQL Query")
         st.code(sql, language="sql")
 
-        # 3) execute SQL with error handling
+        # 3) execute SQL with auto-correction for common column errors
+        df = None
         try:
             job = self.bq.query(sql)
             df = job.result().to_dataframe()
         except BadRequest as e:
-            st.error(f"Errore SQL: {e.message}")
-            return
+            msg = e.message or str(e)
+            m = re.search(r"Unrecognized name: (\w+)", msg, re.IGNORECASE)
+            if m:
+                bad_col = m.group(1)
+                col_map = {
+                    "total_amount": "total_eur",
+                    "amount": "total_eur",
+                    "spend": "total_eur",
+                    "price": "total_eur"
+                }
+                if bad_col in col_map:
+                    corrected = col_map[bad_col]
+                    st.warning(f"Colonna `{bad_col}` non trovata; sostituisco con `{corrected}` e ritento.")
+                    sql_fixed = re.sub(rf"\b{bad_col}\b", corrected, sql, flags=re.IGNORECASE)
+                    st.markdown("### SQL Corretto")
+                    st.code(sql_fixed, language="sql")
+                    try:
+                        job = self.bq.query(sql_fixed)
+                        df = job.result().to_dataframe()
+                    except Exception as e2:
+                        st.error(f"Errore con SQL corretto: {e2}")
+                        return
+                else:
+                    st.error(f"Errore SQL: {msg}")
+                    return
+            else:
+                st.error(f"Errore SQL: {msg}")
+                return
         except Exception as e:
             st.error(f"Errore esecuzione query: {e}")
             return
 
-        if df.empty:
+        if df is None or df.empty:
             st.warning("Nessun risultato.")
             return
 
         # 4) dispatch based on classification
         if analysis == "top_n":
-            # assume two columns: label + metric
             c1, c2 = df.columns[:2]
             lines = [f"Top results by {c2}:"]
             for idx, row in df.iterrows():
@@ -107,7 +132,7 @@ class NL2AnalyticsEngine:
             col = df.columns[0]
             counts = df[col].value_counts().head(10)
             st.bar_chart(counts)
-            st.markdown(f"Distribution of **{col}** (top 10 categories)")
+            st.markdown(f"Distribution of **{col}** (top 10)")
 
         elif analysis == "correlation":
             corr = df.corr()
@@ -115,7 +140,6 @@ class NL2AnalyticsEngine:
             st.dataframe(corr)
 
         elif analysis == "forecast":
-            # assume first column is date, second is numeric
             ds = pd.to_datetime(df.iloc[:, 0])
             y = df.iloc[:, 1]
             df_ts = pd.DataFrame({"ds": ds, "y": y})
