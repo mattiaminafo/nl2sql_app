@@ -70,7 +70,7 @@ class NL2SQLQueryEngine:
             
             # Setup OpenAI client
             if "openai_api_key" in st.secrets:
-                openai.api_key = st.secrets["openai_api_key"]
+                self.openai_client = openai.OpenAI(api_key=st.secrets["openai_api_key"])
             else:
                 st.error("OpenAI API key not found in secrets")
                 return
@@ -108,7 +108,7 @@ class NL2SQLQueryEngine:
         """
         
         try:
-            response = openai.ChatCompletion.create(
+            response = self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You are a SQL expert that converts natural language to BigQuery SQL."},
@@ -129,6 +129,7 @@ class NL2SQLQueryEngine:
             
         except Exception as e:
             logger.error(f"Error generating SQL: {str(e)}")
+            st.error(f"OpenAI API Error: {str(e)}")
             return None
     
     def execute_sql_query(self, sql_query):
