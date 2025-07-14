@@ -12,7 +12,7 @@ from prophet import Prophet  # assicurati di aggiungere "prophet>=1.0" a require
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="NL to SQL Analytics", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="NL to SQL Analytics & Recommendations", page_icon="🔍", layout="wide")
 
 if 'query_history' not in st.session_state:
     st.session_state.query_history = []
@@ -33,10 +33,11 @@ class NL2AnalyticsEngine:
         self.oa = OpenAI(api_key=st.secrets["openai_api_key"])
 
     def classify_request(self, nl: str) -> str:
+        # Extend classification to include recommendation
         system_prompt = (
             "You are an analytics assistant. "
             "Classify the user's request into exactly one of: "
-            "top_n, distribution, correlation, forecast, raw, summary."
+            "top_n, distribution, correlation, forecast, raw, summary, recommendation."
         )
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -65,13 +66,18 @@ class NL2AnalyticsEngine:
         return re.sub(r'```.*?\n|```', '', sql).strip()
 
     def run(self, user_query: str):
-        analysis = self.classify_request(user_query)
-        sql = self.generate_sql(user_query)
+        q_lower = user_query.lower()
+        # Detect recommendation intent even if LLM misclassifies
+        if 'invest' in q_lower or 'why' in q_lower:
+            analysis = 'recommendation'
+        else:
+            analysis = self.classify_request(user_query)
 
-        # Display generated SQL
+        sql = self.generate_sql(user_query)
         st.markdown("### Generated SQL Query")
         st.code(sql, language="sql")
 
+        # Execute with auto column correction
         df = None
         try:
             job = self.bq.query(sql)
@@ -83,10 +89,10 @@ class NL2AnalyticsEngine:
                 bad_col = m.group(1)
                 col_map = {
                     "total_amount": "total_eur",
-                    "amount": "total_eur",
-                    "spend": "total_eur",
-                    "price": "total_eur",
-                    "user_id": "customer_id"
+                    "amount":       "total_eur",
+                    "spend":        "total_eur",
+                    "price":        "total_eur",
+                    "user_id":      "customer_id"
                 }
                 if bad_col in col_map:
                     corrected = col_map[bad_col]
@@ -115,6 +121,42 @@ class NL2AnalyticsEngine:
             return
 
         # Dispatch
+        if analysis == "recommendation":
+            # Compute city metrics
+            metrics_sql = f"""
+SELECT city,
+       COUNT(order_id) AS order_count,
+       SUM(total_eur) AS total_revenue,
+       AVG(total_eur) AS avg_order_value
+FROM `{self.dataset}`
+GROUP BY city
+ORDER BY total_revenue DESC
+LIMIT 10;"""
+            metrics_df = self.bq.query(metrics_sql).result().to_dataframe()
+            st.markdown("### City Metrics")
+            st.dataframe(metrics_df)
+
+            # Build CSV for LLM
+            csv = metrics_df.to_csv(index=False)
+            advice_prompt = (
+                "You are a data-driven investment advisor. "
+                "Given the following city metrics (orders, revenue, avg order value), "
+                "recommend which cities to invest in and why. Use the data to justify your answer.\n\n"
+                f"```csv\n{csv}\n```"
+            )
+            advice = self.oa.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role":"system","content":"Financial advisor"},
+                    {"role":"user","content":advice_prompt}
+                ],
+                temperature=0.7
+            ).choices[0].message.content
+            st.markdown("### Investment Recommendation")
+            st.markdown(advice)
+            return
+
+        # other analysis modes
         if analysis == "top_n":
             c1, c2 = df.columns[:2]
             lines = [f"Top results by {c2}:"]
@@ -141,22 +183,22 @@ class NL2AnalyticsEngine:
             model.fit(df_ts)
             future = model.make_future_dataframe(periods=30)
             forecast = model.predict(future)
-            st.line_chart(forecast.set_index("ds")["yhat", "yhat_lower", "yhat_upper"])
+            st.line_chart(forecast.set_index("ds")["yhat", "yhat_lower", "yhat_upper"])  
             st.markdown("Forecast for next 30 periods")
 
         elif analysis == "raw":
             st.markdown("### Raw Data")
             st.dataframe(df)
 
-        else:
+        else:  # summary
             st.markdown("### Summary (top 5 rows)")
             st.table(df.head(5))
             st.markdown(f"Found **{len(df)}** rows total.")
 
 
 def main():
-    st.title("🔍 Natural Language Analytics Interface")
-    user_query = st.text_input("Ask anything (analytics/statistics/forecast)...")
+    st.title("🔍 NL Analytics & Investment Advisor")
+    user_query = st.text_input("Ask anything (analytics/statistics/forecast/invest)...")
     if st.button("Run"):
         st.session_state.query_history.append(user_query)
         with st.spinner("Processing your request…"):
