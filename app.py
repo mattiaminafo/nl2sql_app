@@ -1,3 +1,4 @@
+````python
 import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
@@ -5,19 +6,14 @@ from google.oauth2 import service_account
 from openai import OpenAI
 import re
 import logging
+from prophet import Prophet  # ensure you have added prophet to requirements.txt
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Page configuration
-st.set_page_config(
-    page_title="Natural Language to SQL Query Interface",
-    page_icon="🔍",
-    layout="wide"
-)
+st.set_page_config(page_title="Natural Language to SQL Query Interface", page_icon="🔍", layout="wide")
 
-# Initialize session state
 if 'query_history' not in st.session_state:
     st.session_state.query_history = []
 
@@ -48,24 +44,17 @@ class NL2SQLQueryEngine:
         self.setup_clients()
 
     def setup_clients(self):
-        # BigQuery client
         try:
             project = st.secrets.get("project_id", "planar-flux-465609-e1")
             if "gcp_service_account" in st.secrets:
-                creds = service_account.Credentials.from_service_account_info(
-                    st.secrets["gcp_service_account"]
-                )
-                self.bq_client = bigquery.Client(
-                    project=project,
-                    credentials=creds
-                )
+                creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+                self.bq_client = bigquery.Client(project=project, credentials=creds)
             else:
                 self.bq_client = bigquery.Client(project=project)
         except Exception as e:
             logger.error(f"BigQuery init error: {e}")
             st.error("Errore di configurazione BigQuery, controlla secrets.")
 
-        # OpenAI client
         try:
             if "openai_api_key" in st.secrets:
                 self.openai_client = OpenAI(api_key=st.secrets["openai_api_key"])
@@ -80,14 +69,10 @@ class NL2SQLQueryEngine:
             st.error("OpenAI client non inizializzato.")
             return None
 
-        schema_desc = "\n".join(
-            f"- {c['name']} ({c['type']}): {c['description']}"
-            for c in self.table_schema
-        )
+        schema_desc = "\n".join(f"- {c['name']} ({c['type']}): {c['description']}" for c in self.table_schema)
         prompt = (
             f"You are a SQL expert. Convert the following natural language query to a valid BigQuery SQL query.\n\n"
-            f"Table: {self.dataset_name}\n"
-            f"Schema:\n{schema_desc}\n\n"
+            f"Table: {self.dataset_name}\nSchema:\n{schema_desc}\n\n"
             "Rules:\n"
             "1. Use only the columns from the schema above\n"
             "2. Return only the SQL query, no explanations\n"
@@ -104,7 +89,7 @@ class NL2SQLQueryEngine:
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You are a SQL expert that converts natural language to BigQuery SQL."},
-                    {"role": "user",   "content": prompt}
+                    {"role": "user", "content": prompt}
                 ],
                 max_tokens=500,
                 temperature=0.1
@@ -119,7 +104,6 @@ class NL2SQLQueryEngine:
     def execute_sql_query(self, sql_query: str) -> tuple[pd.DataFrame | None, str | None]:
         if not self.bq_client:
             return None, "BigQuery client non inizializzato."
-
         if self.dataset_name not in sql_query:
             return None, "La query deve referenziare il dataset corretto."
         try:
@@ -132,27 +116,24 @@ class NL2SQLQueryEngine:
             logger.error(f"Error executing query: {e}")
             return None, f"Errore esecuzione query: {e}"
 
-      def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
-        """Convert query results to natural language response"""
+    def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
         if df is None or df.empty:
             return "Nessun risultato trovato."
-        
         q = original_query.lower()
 
         # single-value
         if len(df.columns) == 1 and len(df) == 1:
             col = df.columns[0]
             val = df.iloc[0, 0]
-            if "count" in col.lower() or "total" in col.lower():
+            if any(k in col.lower() for k in ["count", "total"]):
                 return f"The result is {val:,.0f}"
-            if "avg" in col.lower() or "average" in col.lower():
+            if any(k in col.lower() for k in ["avg", "average"]):
                 return f"The average value is {val:,.2f}"
             return f"The result is {val}"
 
         # two-column results: support top-N lists
         if len(df.columns) == 2:
             c1, c2 = df.columns
-            # prova a estrarre “3 cities” o simili
             m = re.search(r'(\d+)\s+cities?', q)
             if m:
                 n = int(m.group(1))
@@ -160,25 +141,47 @@ class NL2SQLQueryEngine:
                 for i, row in enumerate(df.head(n).itertuples(index=False), start=1):
                     lines.append(f"{i}. {getattr(row, c1)} with {getattr(row, c2):,.0f} orders")
                 return "\n".join(lines)
-            # fallback: se menzioni “city” ma non un numero, restituisci il primo
             if "city" in q:
                 top = df.iloc[0]
                 return f"The city with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
-            # fallback generico
             top = df.iloc[0]
             return f"The top result is {top[c1]} with {top[c2]}"
 
-        # up to 5 righe: elenco puntato
+        # distribution chart
+        if any(k in q for k in ["distribution", "histogram", "spread"]):
+            col = df.columns[0]
+            counts = df[col].value_counts().head(10)
+            st.bar_chart(counts)
+            return f"Showing distribution of {col} (top 10 categories)."
+
+        # correlation table
+        if "correlation" in q:
+            corr = df.corr()
+            st.dataframe(corr)
+            return "Correlation matrix displayed."
+
+        # forecast
+        if any(k in q for k in ["forecast", "predict", "trend", "next", "future"]):
+            # assume first col is date, second is value
+            ds = pd.to_datetime(df.iloc[:, 0])
+            y = df.iloc[:, 1]
+            df_prophet = pd.DataFrame({"ds": ds, "y": y})
+            m = Prophet()
+            m.fit(df_prophet)
+            future = m.make_future_dataframe(periods=30)
+            fcst = m.predict(future)
+            st.line_chart(fcst.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])
+            return "Forecast for next 30 periods displayed."
+
+        # up to 5 rows list
         if len(df) <= 5:
             text = "Here are the results:\n"
             for _, row in df.iterrows():
                 text += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
             return text
 
-        # più di 5 righe: dico quanti e mostro i primi 5
+        # fallback: show count and head
         return f"Found {len(df)} results. Here are the top 5:\n" + df.head().to_string(index=False)
-
-
 
 def main():
     st.title("🔍 Natural Language to SQL Query Interface")
@@ -196,6 +199,9 @@ def main():
         - How many orders were placed last month?
         - Which country has the highest total revenue?
         - Show me the top 5 cities by order count
+        - Show distribution of cities
+        - Correlation between total_eur and order_date_timestamp
+        - Forecast next month's total_eur
         """)
         if st.session_state.query_history:
             st.header("🕐 Recent Queries")
@@ -203,23 +209,15 @@ def main():
                 st.text(f"{i+1}. {q[:50]}...")
 
     col1, col2 = st.columns([3, 1])
-    with col1:
-        user_query = st.text_input(
-            "Enter your question in English:",
-            placeholder="e.g., Which city has the most orders?"
-        )
-    with col2:
-        ask_button = st.button("Ask Question", type="primary")
+    user_query = col1.text_input("Enter your question in English:", placeholder="e.g., Which city has the most orders?")
+    ask_button = col2.button("Ask Question", type="primary")
 
     if ask_button and user_query:
         st.session_state.query_history.append(user_query)
         with st.spinner("Processing your question..."):
-            st.info("🤖 Converting your question to SQL...")
             sql = st.session_state.query_engine.generate_sql_from_nl(user_query)
             if sql:
-                with st.expander("Generated SQL Query"):
-                    st.code(sql, language="sql")
-                st.info("🔍 Executing query on BigQuery...")
+                st.expander("Generated SQL Query", expanded=True).code(sql, language="sql")
                 df, error = st.session_state.query_engine.execute_sql_query(sql)
                 if error:
                     st.error(f"Query Error: {error}")
@@ -227,14 +225,15 @@ def main():
                     resp = st.session_state.query_engine.format_results_to_natural_language(df, user_query)
                     st.success("✅ Query executed successfully!")
                     st.markdown("### 📊 Answer:")
-                    st.markdown(f"**{resp}**")
+                    st.markdown(f"{resp}")
                     if st.checkbox("Show raw data"):
                         st.dataframe(df)
             else:
                 st.error("Non sono riuscito a generare una query SQL valida. Riprova a riformulare.")
 
     st.markdown("---")
-    st.markdown("*Powered by OpenAI GPT-3.5 and Google BigQuery*")
+    st.markdown("*Powered by OpenAI GPT-3.5, Google BigQuery & Prophet*")
 
 if __name__ == "__main__":
     main()
+````
