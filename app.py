@@ -116,7 +116,7 @@ class NL2SQLQueryEngine:
             return None, f"Errore esecuzione query: {e}"
 
         def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
-        """Convert query results to natural language response, support top-N lists."""
+        
         if df is None or df.empty:
             return "Nessun risultato trovato."
         
