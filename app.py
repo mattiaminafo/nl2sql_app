@@ -132,9 +132,12 @@ class NL2SQLQueryEngine:
             logger.error(f"Error executing query: {e}")
             return None, f"Errore esecuzione query: {e}"
 
-    def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
+      def format_results_to_natural_language(self, df: pd.DataFrame, original_query: str) -> str:
+        """Convert query results to natural language response"""
         if df is None or df.empty:
             return "Nessun risultato trovato."
+        
+        q = original_query.lower()
 
         # single-value
         if len(df.columns) == 1 and len(df) == 1:
@@ -146,27 +149,36 @@ class NL2SQLQueryEngine:
                 return f"The average value is {val:,.2f}"
             return f"The result is {val}"
 
-        # two-column top result
+        # two-column results: support top-N lists
         if len(df.columns) == 2:
             c1, c2 = df.columns
-            top = df.iloc[0]
-            q = original_query.lower()
+            # prova a estrarre “3 cities” o simili
+            m = re.search(r'(\d+)\s+cities?', q)
+            if m:
+                n = int(m.group(1))
+                lines = [f"Top {n} cities by {c2}:"]
+                for i, row in enumerate(df.head(n).itertuples(index=False), start=1):
+                    lines.append(f"{i}. {getattr(row, c1)} with {getattr(row, c2):,.0f} orders")
+                return "\n".join(lines)
+            # fallback: se menzioni “city” ma non un numero, restituisci il primo
             if "city" in q:
+                top = df.iloc[0]
                 return f"The city with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
-            if "country" in q:
-                return f"The country with the highest value is {top[c1]} with {top[c2]:,.2f}"
-            if "channel" in q:
-                return f"The channel with the most orders is {top[c1]} with {top[c2]:,.0f} orders"
-            return f"The top result is {top[c1]} with {top[c2]}"      
+            # fallback generico
+            top = df.iloc[0]
+            return f"The top result is {top[c1]} with {top[c2]}"
 
-        # multiple rows
+        # up to 5 righe: elenco puntato
         if len(df) <= 5:
             text = "Here are the results:\n"
             for _, row in df.iterrows():
                 text += "• " + ", ".join(f"{c}: {row[c]}" for c in df.columns) + "\n"
             return text
 
+        # più di 5 righe: dico quanti e mostro i primi 5
         return f"Found {len(df)} results. Here are the top 5:\n" + df.head().to_string(index=False)
+
+
 
 def main():
     st.title("🔍 Natural Language to SQL Query Interface")
