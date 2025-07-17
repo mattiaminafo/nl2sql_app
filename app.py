@@ -102,7 +102,9 @@ class NL2AnalyticsEngine:
         system_prompt = (
             "You are an analytics assistant. "
             "Classify the user's request into exactly one of: "
-            "top_n, distribution, correlation, forecast, raw, summary, recommendation."
+            "top_n, distribution, correlation, forecast, raw, summary, recommendation.\n\n"
+            "IMPORTANT: Use 'forecast' for any request about predicting future values, "
+            "trends, or 'next month/week/year' data, even if the word 'forecast' is not used."
         )
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -114,6 +116,34 @@ class NL2AnalyticsEngine:
         )
         return response.choices[0].message.content.strip().lower()
 
+    def generate_forecast_sql(self, nl: str) -> str:
+        """Genera SQL specifico per raccogliere dati storici per forecasting"""
+        prompt = (
+            f"You are a BigQuery SQL expert. The user wants to forecast: \"{nl}\"\n\n"
+            f"Generate SQL to get HISTORICAL DATA for forecasting from table {self.full_table_name}.\n\n"
+            f"IMPORTANT: \n"
+            f"- Do NOT try to predict future data in SQL\n"
+            f"- Return historical data that can be used for time series forecasting\n"
+            f"- Use DATE(order_date_timestamp) for date grouping\n"
+            f"- Order by date ASC for time series\n"
+            f"- Common patterns:\n"
+            f"  * Daily orders: SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders\n"
+            f"  * Monthly orders: SELECT DATE_TRUNC(DATE(order_date_timestamp), MONTH) as month, COUNT(*) as orders\n"
+            f"  * Weekly orders: SELECT DATE_TRUNC(DATE(order_date_timestamp), WEEK) as week, COUNT(*) as orders\n\n"
+            f"Available columns: {', '.join(self.schema.keys())}\n"
+            f"Focus on historical trends that can be extrapolated."
+        )
+        
+        response = self.oa.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "BigQuery SQL expert for time series data preparation"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1
+        )
+        sql = response.choices[0].message.content
+        return re.sub(r'```.*?\n|```', '', sql).strip()
     def generate_sql(self, nl: str) -> str:
         # Crea la descrizione delle colonne per il prompt
         columns_info = []
@@ -345,27 +375,74 @@ class NL2AnalyticsEngine:
         elif analysis == "forecast":
             if len(df.columns) >= 2:
                 try:
-                    ds = pd.to_datetime(df.iloc[:, 0])
-                    y = df.iloc[:, 1]
-                    df_ts = pd.DataFrame({"ds": ds, "y": y}).sort_values("ds")
+                    # Assicurati che i dati siano ordinati per data
+                    df_sorted = df.sort_values(df.columns[0])
                     
-                    model = Prophet()
+                    # Converte la prima colonna in datetime
+                    ds = pd.to_datetime(df_sorted.iloc[:, 0])
+                    y = df_sorted.iloc[:, 1].astype(float)
+                    
+                    # Crea DataFrame per Prophet
+                    df_ts = pd.DataFrame({"ds": ds, "y": y})
+                    
+                    st.markdown("### Historical Data")
+                    st.line_chart(df_ts.set_index("ds"))
+                    
+                    # Verifica che ci siano abbastanza dati
+                    if len(df_ts) < 10:
+                        st.warning("Non ci sono abbastanza dati storici per un forecast accurato")
+                        st.dataframe(df_ts)
+                        return
+                    
+                    # Addestra il modello Prophet
+                    model = Prophet(
+                        daily_seasonality=True,
+                        weekly_seasonality=True,
+                        yearly_seasonality=True if len(df_ts) > 365 else False
+                    )
                     model.fit(df_ts)
-                    future = model.make_future_dataframe(periods=30)
+                    
+                    # Determina il periodo di forecast basato sulla query
+                    if 'month' in user_query.lower():
+                        forecast_periods = 30
+                        period_name = "30 days (next month)"
+                    elif 'week' in user_query.lower():
+                        forecast_periods = 7
+                        period_name = "7 days (next week)"
+                    elif 'year' in user_query.lower():
+                        forecast_periods = 365
+                        period_name = "365 days (next year)"
+                    else:
+                        forecast_periods = 30
+                        period_name = "30 days"
+                    
+                    # Genera forecast
+                    future = model.make_future_dataframe(periods=forecast_periods)
                     forecast = model.predict(future)
                     
-                    st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])  
-                    st.markdown("### Forecast for next 30 periods")
+                    # Mostra forecast
+                    st.markdown(f"### Forecast for {period_name}")
+                    forecast_chart = forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]]
+                    st.line_chart(forecast_chart)
                     
-                    # Mostra anche i dati storici
-                    st.line_chart(df_ts.set_index("ds"))
-                    st.markdown("### Historical Data")
+                    # Mostra le predizioni future
+                    future_forecast = forecast.tail(forecast_periods)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+                    future_forecast.columns = ["Date", "Predicted", "Lower_Bound", "Upper_Bound"]
+                    st.markdown("### Future Predictions")
+                    st.dataframe(future_forecast)
+                    
+                    # Calcola totale previsto
+                    total_predicted = future_forecast["Predicted"].sum()
+                    st.markdown(f"### Summary")
+                    st.metric("Total Predicted Orders", f"{total_predicted:,.0f}")
+                    
                 except Exception as e:
                     st.error(f"Errore nel forecasting: {e}")
                     st.markdown("### Raw Data")
                     st.dataframe(df)
             else:
                 st.warning("Servono almeno 2 colonne per il forecasting")
+                st.dataframe(df)
 
         elif analysis == "raw":
             st.markdown("### Raw Data")
