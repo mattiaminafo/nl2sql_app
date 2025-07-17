@@ -8,31 +8,28 @@ from openai import OpenAI
 import re
 import logging
 from prophet import Prophet
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="NL to SQL Analytics & Recommendations", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Smart Analytics Assistant", page_icon="🤖", layout="wide")
 
 if 'query_history' not in st.session_state:
     st.session_state.query_history = []
 
-class NL2AnalyticsEngine:
+class SmartAnalyticsEngine:
     def __init__(self):
         self.project_id = st.secrets["project_id"]
         self.dataset_id = "locatify_dataset_1"
         self.table_id = "brand_orders"
-        self.bq = None
-        self.oa = None
-        self.dataset_location = None
-        self.schema = self._get_table_schema()
-        self._setup_clients()
-        self._verify_dataset_access()
-
-    def _get_table_schema(self):
-        """Restituisce lo schema della tabella con i tipi di dato"""
-        return {
+        self.full_table_name = f"`{self.project_id}.{self.dataset_id}.{self.table_id}`"
+        
+        # Schema del database
+        self.schema = {
             "unique_id": "STRING",
             "order_id": "STRING", 
             "channel": "STRING",
@@ -50,547 +47,458 @@ class NL2AnalyticsEngine:
             "longitude": "FLOAT",
             "inserted_at": "TIMESTAMP"
         }
-    
+        
+        self.bq = None
+        self.oa = None
+        self._setup_clients()
+
     def _setup_clients(self):
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
         )
-        # Inizializza il client BigQuery
         self.bq = bigquery.Client(project=self.project_id, credentials=creds)
         self.oa = OpenAI(api_key=st.secrets["openai_api_key"])
 
-    def _verify_dataset_access(self):
-        """Verifica l'accesso al dataset e rileva la location"""
-        try:
-            # Prima prova a listare i dataset disponibili
-            datasets = list(self.bq.list_datasets())
-            available_datasets = [d.dataset_id for d in datasets]
-            
-            if self.dataset_id not in available_datasets:
-                st.error(f"Dataset '{self.dataset_id}' non trovato!")
-                st.info(f"Dataset disponibili: {available_datasets}")
-                return False
-            
-            # Ottieni informazioni sul dataset
-            dataset_ref = self.bq.dataset(self.dataset_id)
-            dataset = self.bq.get_dataset(dataset_ref)
-            self.dataset_location = dataset.location
-            
-            # Verifica che la tabella esista
-            try:
-                table_ref = dataset_ref.table(self.table_id)
-                table = self.bq.get_table(table_ref)
-                st.success(f"✅ Dataset e tabella trovati! Location: {self.dataset_location}")
-                return True
-            except NotFound:
-                # Lista le tabelle disponibili
-                tables = list(self.bq.list_tables(dataset))
-                available_tables = [t.table_id for t in tables]
-                st.error(f"Tabella '{self.table_id}' non trovata!")
-                st.info(f"Tabelle disponibili: {available_tables}")
-                return False
-                
-        except Exception as e:
-            st.error(f"Errore nella verifica del dataset: {e}")
-            return False
-
-    @property
-    def full_table_name(self):
-        return f"`{self.project_id}.{self.dataset_id}.{self.table_id}`"
-
-    def classify_request(self, nl: str) -> str:
-        system_prompt = (
-            "You are an analytics assistant. "
-            "Classify the user's request into exactly one of: "
-            "top_n, distribution, correlation, forecast, raw, summary, recommendation.\n\n"
-            "IMPORTANT: Use 'forecast' for any request about predicting future values, "
-            "trends, or 'next month/week/year' data, even if the word 'forecast' is not used."
-        )
-        response = self.oa.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Request: \"{nl}\""}
-            ],
-            temperature=0
-        )
-        return response.choices[0].message.content.strip().lower()
-
-    def generate_forecast_sql(self, nl: str) -> str:
-        """Genera SQL specifico per raccogliere dati storici per forecasting"""
-        prompt = (
-            f"The user wants to forecast: \"{nl}\"\n\n"
-            f"Generate SQL to get HISTORICAL TIME SERIES DATA from {self.full_table_name}.\n\n"
-            f"⚠️ CRITICAL: NEVER use future dates or WHERE conditions that look for future data!\n"
-            f"📊 ALWAYS get historical data to train a forecasting model\n\n"
-            f"MANDATORY RULES:\n"
-            f"- ALWAYS return at least 2 columns: date and metric\n"
-            f"- Use DATE(order_date_timestamp) as the date column\n"
-            f"- Use COUNT(*) or COUNT(order_id) to count orders per date\n"
-            f"- Use SUM(total_eur) for revenue forecasting\n"
-            f"- ALWAYS GROUP BY the date column\n"
-            f"- ALWAYS ORDER BY date ASC for time series\n"
-            f"- If user mentions 'by city' or location, add city as third column\n\n"
-            f"EXAMPLES:\n"
-            f"📈 'forecast orders until end of 2025' → \n"
-            f"SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
-            f"FROM {self.full_table_name} \n"
-            f"GROUP BY DATE(order_date_timestamp) \n"
-            f"ORDER BY date ASC\n\n"
-            f"📈 'how many orders will I make' → \n"
-            f"SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
-            f"FROM {self.full_table_name} \n"
-            f"GROUP BY DATE(order_date_timestamp) \n"
-            f"ORDER BY date ASC\n\n"
-            f"🏙️ 'forecast next month orders by city' → \n"
-            f"SELECT DATE(order_date_timestamp) as date, city, COUNT(*) as orders \n"
-            f"FROM {self.full_table_name} \n"
-            f"GROUP BY DATE(order_date_timestamp), city \n"
-            f"ORDER BY date ASC, city\n\n"
-            f"💰 'forecast revenue by channel' → \n"
-            f"SELECT DATE(order_date_timestamp) as date, channel, SUM(total_eur) as revenue \n"
-            f"FROM {self.full_table_name} \n"
-            f"GROUP BY DATE(order_date_timestamp), channel \n"
-            f"ORDER BY date ASC, channel\n\n"
-            f"Available columns: {', '.join(self.schema.keys())}\n\n"
-            f"🎯 REMEMBER: Always return DATE + METRIC columns, never just dates!\n"
-            f"Generate ONLY the SQL for HISTORICAL data, no explanations."
-        )
+    def analyze_question(self, question: str) -> dict:
+        """Analizza la domanda e determina il tipo di risposta necessaria"""
         
+        # Keywords per identificare il tipo di analisi
+        forecasting_keywords = [
+            'previsione', 'prevision', 'forecast', 'predict', 'futuro', 'future',
+            'prossimo', 'next', 'dovrei investire', 'should invest', 'raccomanda',
+            'recommend', 'strategia', 'strategy', 'migliore', 'best', 'quale città',
+            'which city', 'dove', 'where', 'perché', 'why', 'motivazione'
+        ]
+        
+        time_keywords = [
+            'trend', 'andamento', 'nel tempo', 'over time', 'crescita', 'growth',
+            'stagionalità', 'seasonal', 'mensile', 'monthly', 'giornaliero', 'daily'
+        ]
+        
+        q_lower = question.lower()
+        
+        # Determina il tipo di analisi
+        is_forecasting = any(keyword in q_lower for keyword in forecasting_keywords)
+        is_time_series = any(keyword in q_lower for keyword in time_keywords) or is_forecasting
+        
+        return {
+            'is_forecasting': is_forecasting,
+            'is_time_series': is_time_series,
+            'original_question': question
+        }
+
+    def generate_sql(self, question: str, analysis_type: dict) -> str:
+        """Genera SQL intelligente basato sulla domanda"""
+        
+        # Crea descrizione dello schema
+        schema_desc = "\n".join([f"- {col}: {dtype}" for col, dtype in self.schema.items()])
+        
+        # Context specifico per il tipo di analisi
+        if analysis_type['is_forecasting']:
+            context = (
+                "L'utente vuole previsioni o raccomandazioni strategiche. "
+                "Genera SQL per ottenere dati storici che permettano analisi predittive. "
+                "Includi sempre una dimensione temporale (DATE(order_date_timestamp)) quando possibile."
+            )
+        elif analysis_type['is_time_series']:
+            context = (
+                "L'utente vuole analisi temporali o trend. "
+                "Genera SQL che includa DATE(order_date_timestamp) per analisi nel tempo."
+            )
+        else:
+            context = (
+                "L'utente vuole un'analisi descrittiva o statistica. "
+                "Genera SQL per rispondere direttamente alla domanda."
+            )
+
+        prompt = f"""
+Sei un esperto di BigQuery SQL. L'utente ha fatto questa domanda: "{question}"
+
+CONTESTO: {context}
+
+SCHEMA TABELLA {self.full_table_name}:
+{schema_desc}
+
+REGOLE IMPORTANTI:
+- Usa ESATTAMENTE i nomi delle colonne dello schema
+- Per date usa: DATE(order_date_timestamp)
+- Per ordini usa: COUNT(*) o COUNT(order_id) 
+- Per revenue usa: SUM(total_eur)
+- Per clienti usa: customer_id
+- Sempre ORDER BY appropriato
+- Se è un'analisi temporale, includi sempre la data
+
+ESEMPI:
+- "quanti ordini questo mese" → WHERE DATE(order_date_timestamp) >= DATE_TRUNC(CURRENT_DATE(), MONTH)
+- "cliente che spende di più" → GROUP BY customer_id ORDER BY SUM(total_eur) DESC
+- "trend mensile ordini" → GROUP BY DATE_TRUNC(DATE(order_date_timestamp), MONTH)
+
+Genera SOLO il SQL, senza spiegazioni:
+"""
+
         response = self.oa.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "SQL expert: Always return DATE + METRIC columns for time series. Never just dates!"},
+                {"role": "system", "content": "Esperto SQL che genera query precise e ottimizzate"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
         )
-        sql = response.choices[0].message.content
-        return re.sub(r'```.*?\n|```', '', sql).strip()
-    def generate_sql(self, nl: str) -> str:
-        # Crea la descrizione delle colonne per il prompt
-        columns_info = []
-        for col_name, col_type in self.schema.items():
-            columns_info.append(f"- {col_name} ({col_type})")
         
-        columns_desc = "\n".join(columns_info)
-        
-        prompt = (
-            f"You are a BigQuery SQL expert. Given the request:\n\"{nl}\"\n\n"
-            f"Generate only the SQL (no explanations) on table {self.full_table_name}.\n\n"
-            f"IMPORTANT: Use EXACTLY these column names:\n{columns_desc}\n\n"
-            f"Common mappings:\n"
-            f"- For dates/time: use 'order_date_timestamp' (TIMESTAMP)\n"
-            f"- For order value/amount/price: use 'total_eur' (FLOAT)\n"
-            f"- For customer/user: use 'customer_id' (STRING)\n"
-            f"- For sales channel: use 'channel' (STRING)\n"
-            f"- For location: use 'city' and 'country_code'\n\n"
-            f"BIGQUERY TIMESTAMP RULES:\n"
-            f"- Use DATE(order_date_timestamp) to extract date from timestamp\n"
-            f"- Use DATETIME(order_date_timestamp) to extract datetime from timestamp\n"
-            f"- For date arithmetic, convert to DATE first: DATE_ADD(DATE(order_date_timestamp), INTERVAL 1 MONTH)\n"
-            f"- Use DATE_SUB() and DATE_ADD() for date operations, NOT TIMESTAMP_ADD with MONTH\n"
-            f"- For time-based filtering: WHERE order_date_timestamp >= '2024-01-01' AND order_date_timestamp < '2024-02-01'\n"
-            f"- For grouping by date: GROUP BY DATE(order_date_timestamp)\n"
-            f"- For extracting year/month: EXTRACT(YEAR FROM order_date_timestamp), EXTRACT(MONTH FROM order_date_timestamp)\n\n"
-            f"Examples:\n"
-            f"- Daily trends: SELECT DATE(order_date_timestamp) as order_date, COUNT(*) FROM table GROUP BY DATE(order_date_timestamp)\n"
-            f"- Monthly trends: SELECT DATE_TRUNC(DATE(order_date_timestamp), MONTH) as month, COUNT(*) FROM table GROUP BY month\n"
-            f"- Last 30 days: WHERE order_date_timestamp >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n"
-            f"- Next month data: WHERE DATE(order_date_timestamp) >= DATE_ADD(CURRENT_DATE(), INTERVAL 1 MONTH)"
-        )
-        
-        response = self.oa.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "BigQuery SQL expert with exact schema and timestamp handling knowledge"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1
-        )
         sql = response.choices[0].message.content
         return re.sub(r'```.*?\n|```', '', sql).strip()
 
-    def execute_query(self, sql: str):
-        """Esegue la query con gestione errori migliorata"""
+    def execute_sql(self, sql: str) -> pd.DataFrame:
+        """Esegue SQL con gestione errori intelligente"""
         try:
-            # Esegui la query direttamente senza specificare location nel job config
             job = self.bq.query(sql)
             return job.result().to_dataframe()
-            
         except BadRequest as e:
-            msg = e.message or str(e)
+            msg = str(e)
             
-            # Gestione errori di colonne non riconosciute
-            m = re.search(r"Unrecognized name: (\w+)", msg, re.IGNORECASE)
-            if m:
-                bad_col = m.group(1)
-                col_map = {
-                    "order_date": "order_date_timestamp",
-                    "date": "order_date_timestamp", 
-                    "order_time": "order_date_timestamp",
-                    "timestamp": "order_date_timestamp",
-                    "total_amount": "total_eur",
-                    "amount": "total_eur",
-                    "spend": "total_eur",
-                    "price": "total_eur",
-                    "revenue": "total_eur",
-                    "sales": "total_eur",
-                    "user_id": "customer_id",
-                    "customer": "customer_id"
-                }
-                if bad_col in col_map:
-                    corrected = col_map[bad_col]
-                    st.warning(f"Colonna `{bad_col}` non trovata; sostituisco con `{corrected}`")
-                    sql_fixed = re.sub(rf"\b{bad_col}\b", corrected, sql, flags=re.IGNORECASE)
-                    st.markdown("### SQL Corretto")
-                    st.code(sql_fixed, language="sql")
+            # Auto-correzione errori comuni
+            if "Unrecognized name" in msg:
+                # Estrai il nome della colonna errata
+                match = re.search(r"Unrecognized name: (\w+)", msg)
+                if match:
+                    wrong_col = match.group(1)
                     
-                    # Riprova con SQL corretto
-                    try:
-                        job = self.bq.query(sql_fixed)
-                        return job.result().to_dataframe()
-                    except Exception as e2:
-                        st.error(f"Errore con SQL corretto: {e2}")
-                        return None
-                else:
-                    st.error(f"Colonna `{bad_col}` non riconosciuta e non mappata")
-                    # Mostra le colonne disponibili
-                    available_cols = list(self.schema.keys())
-                    st.info(f"Colonne disponibili: {', '.join(available_cols)}")
-                    return None
+                    # Mappature comuni
+                    col_fixes = {
+                        'order_date': 'order_date_timestamp',
+                        'date': 'order_date_timestamp',
+                        'amount': 'total_eur',
+                        'total_amount': 'total_eur',
+                        'revenue': 'total_eur',
+                        'user_id': 'customer_id'
+                    }
+                    
+                    if wrong_col in col_fixes:
+                        fixed_sql = re.sub(rf'\b{wrong_col}\b', col_fixes[wrong_col], sql)
+                        st.warning(f"🔧 Corretto: {wrong_col} → {col_fixes[wrong_col]}")
+                        st.code(fixed_sql, language="sql")
+                        return self.execute_sql(fixed_sql)
             
-            # Gestione errori specifici di BigQuery TIMESTAMP
-            elif "TIMESTAMP_ADD does not support the MONTH date part" in msg:
-                st.warning("Errore TIMESTAMP_ADD con MONTH - correggo con DATE_ADD")
-                # Sostituisci TIMESTAMP_ADD con DATE_ADD e converti a DATE
-                sql_fixed = re.sub(
-                    r'TIMESTAMP_ADD\s*\(\s*([^,]+),\s*INTERVAL\s+(\d+)\s+MONTH\s*\)',
-                    r'DATE_ADD(DATE(\1), INTERVAL \2 MONTH)',
-                    sql,
-                    flags=re.IGNORECASE
-                )
-                st.markdown("### SQL Corretto")
-                st.code(sql_fixed, language="sql")
-                
-                try:
-                    job = self.bq.query(sql_fixed)
-                    return job.result().to_dataframe()
-                except Exception as e2:
-                    st.error(f"Errore con SQL corretto: {e2}")
-                    return None
-                    
-            elif "does not support the MONTH date part when the argument is TIMESTAMP type" in msg:
-                st.warning("Errore operazione MONTH su TIMESTAMP - correggo convertendo a DATE")
-                # Trova e correggi operazioni di data su timestamp
-                sql_fixed = re.sub(
-                    r'([A-Z_]+)\s*\(\s*(order_date_timestamp),\s*INTERVAL\s+(\d+)\s+MONTH\s*\)',
-                    r'\1(DATE(\2), INTERVAL \3 MONTH)',
-                    sql,
-                    flags=re.IGNORECASE
-                )
-                st.markdown("### SQL Corretto")
-                st.code(sql_fixed, language="sql")
-                
-                try:
-                    job = self.bq.query(sql_fixed)
-                    return job.result().to_dataframe()
-                except Exception as e2:
-                    st.error(f"Errore con SQL corretto: {e2}")
-                    return None
-            else:
-                st.error(f"Errore SQL: {msg}")
-                return None
-                
-        except NotFound as e:
-            st.error(f"Dataset/tabella non trovati: {e}")
+            st.error(f"❌ Errore SQL: {msg}")
             return None
         except Exception as e:
-            st.error(f"Errore esecuzione query: {e}")
+            st.error(f"❌ Errore esecuzione: {e}")
             return None
 
-    def run(self, user_query: str):
-        # Debug command
-        if user_query.lower() == "debug":
-            self._verify_dataset_access()
-            return
-            
-        q_lower = user_query.lower()
-        if 'invest' in q_lower or 'why' in q_lower:
-            analysis = 'recommendation'
-        else:
-            analysis = self.classify_request(user_query)
-
-        sql = self.generate_sql(user_query)
-        st.markdown("### Generated SQL Query")
-        st.code(sql, language="sql")
-
-        df = self.execute_query(sql)
+    def create_visualization(self, df: pd.DataFrame, question: str) -> None:
+        """Crea visualizzazioni intelligenti basate sui dati"""
         if df is None or df.empty:
-            st.warning("Nessun risultato ottenuto.")
             return
-
-        # Resto del codice per l'analisi...
-        if analysis == "recommendation":
-            metrics_sql = f"""
-            SELECT city,
-                   COUNT(order_id) AS order_count,
-                   SUM(total_eur) AS total_revenue,
-                   AVG(total_eur) AS avg_order_value
-            FROM {self.full_table_name}
-            GROUP BY city
-            ORDER BY total_revenue DESC
-            LIMIT 10;"""
             
-            metrics_df = self.execute_query(metrics_sql)
-            if metrics_df is not None and not metrics_df.empty:
-                st.markdown("### City Metrics")
-                st.dataframe(metrics_df)
+        # Identifica colonne temporali
+        date_cols = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()]
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        # Se ci sono date, crea grafici temporali
+        if date_cols and numeric_cols:
+            date_col = date_cols[0]
+            if len(numeric_cols) > 0:
+                df[date_col] = pd.to_datetime(df[date_col])
+                df_sorted = df.sort_values(date_col)
                 
-                csv = metrics_df.to_csv(index=False)
-                advice_prompt = (
-                    "You are a data-driven investment advisor. "
-                    "Given the following city metrics (orders, revenue, avg order value), "
-                    "recommend which cities to invest in and why. Use the data to justify your answer.\n\n"
-                    f"```csv\n{csv}\n```"
-                )
-                advice = self.oa.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role":"system","content":"Financial advisor"},
-                        {"role":"user","content":advice_prompt}
-                    ],
-                    temperature=0.7
-                ).choices[0].message.content
-                st.markdown("### Investment Recommendation")
-                st.markdown(advice)
+                for num_col in numeric_cols[:2]:  # Max 2 metriche
+                    fig = px.line(df_sorted, x=date_col, y=num_col, 
+                                title=f"{num_col.title()} nel tempo")
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        # Grafici per top rankings
+        elif len(df.columns) >= 2 and len(df) <= 20:
+            if df.dtypes.iloc[1] in ['int64', 'float64']:
+                fig = px.bar(df.head(10), x=df.columns[0], y=df.columns[1],
+                           title=f"Top {df.columns[0]} per {df.columns[1]}")
+                st.plotly_chart(fig, use_container_width=True)
+
+    def generate_insights(self, df: pd.DataFrame, question: str, analysis_type: dict) -> str:
+        """Genera insights intelligenti sui dati"""
+        if df is None or df.empty:
+            return "Nessun dato disponibile per l'analisi."
+        
+        # Prepara i dati per l'AI
+        if len(df) > 10:
+            sample_data = df.head(10).to_string(index=False)
+            data_summary = f"Mostrando prime 10 righe di {len(df)} totali:\n{sample_data}"
+        else:
+            data_summary = df.to_string(index=False)
+        
+        # Determina il tipo di insight richiesto
+        if analysis_type['is_forecasting']:
+            insight_type = "Fornisci raccomandazioni strategiche e previsioni basate sui dati"
+        else:
+            insight_type = "Fornisci insights analitici e spiegazioni dei pattern nei dati"
+        
+        prompt = f"""
+Domanda utente: "{question}"
+
+Dati ottenuti:
+{data_summary}
+
+{insight_type}. Rispondi in modo:
+- Chiaro e actionable
+- Con numeri specifici dai dati
+- Se è una previsione, spiega il ragionamento
+- Se è un'analisi, evidenzia i pattern principali
+- Massimo 3-4 punti chiave
+
+Rispondi in italiano:
+"""
+
+        response = self.oa.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Analista di business che fornisce insights chiari e actionable"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+
+    def run_forecast(self, df: pd.DataFrame, question: str) -> None:
+        """Esegue forecasting avanzato quando richiesto"""
+        if df is None or df.empty or len(df.columns) < 2:
             return
-
-        # Altri tipi di analisi...
-        if analysis == "top_n":
-            if len(df.columns) >= 2:
-                c1, c2 = df.columns[:2]
-                lines = [f"Top results by {c2}:"]
-                for idx, row in df.iterrows():
-                    if idx >= 10:  # Limita a 10 risultati
-                        break
-                    lines.append(f"{idx+1}. {row[c1]} → {row[c2]:,.0f}")
-                st.markdown("\n".join(lines))
+            
+        try:
+            # Trova colonne date e numeriche
+            date_cols = [col for col in df.columns if any(keyword in col.lower() for keyword in ['date', 'time'])]
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            if not date_cols or not numeric_cols:
+                return
+                
+            date_col = date_cols[0]
+            metric_col = numeric_cols[0]
+            
+            # Prepara dati per Prophet
+            df_clean = df[[date_col, metric_col]].dropna()
+            df_clean[date_col] = pd.to_datetime(df_clean[date_col])
+            df_clean = df_clean.sort_values(date_col)
+            
+            if len(df_clean) < 10:
+                st.warning("⚠️ Troppo pochi dati per un forecast accurato")
+                return
+            
+            # Crea DataFrame per Prophet
+            prophet_df = pd.DataFrame({
+                'ds': df_clean[date_col],
+                'y': df_clean[metric_col]
+            })
+            
+            # Addestra modello
+            model = Prophet(
+                daily_seasonality=True,
+                weekly_seasonality=True,
+                yearly_seasonality=len(prophet_df) > 365
+            )
+            model.fit(prophet_df)
+            
+            # Determina periodo di forecast
+            if any(word in question.lower() for word in ['mese', 'month']):
+                periods = 30
+                period_name = "prossimo mese"
+            elif any(word in question.lower() for word in ['anno', 'year', '2025']):
+                periods = 365
+                period_name = "prossimo anno"
             else:
-                st.dataframe(df)
+                periods = 60
+                period_name = "prossimi 2 mesi"
+            
+            # Genera forecast
+            future = model.make_future_dataframe(periods=periods)
+            forecast = model.predict(future)
+            
+            # Visualizza risultati
+            st.subheader("📈 Previsione")
+            
+            # Grafico forecast
+            fig = go.Figure()
+            
+            # Dati storici
+            fig.add_trace(go.Scatter(
+                x=prophet_df['ds'], y=prophet_df['y'],
+                mode='lines+markers', name='Dati Storici',
+                line=dict(color='blue')
+            ))
+            
+            # Previsioni
+            future_only = forecast.tail(periods)
+            fig.add_trace(go.Scatter(
+                x=future_only['ds'], y=future_only['yhat'],
+                mode='lines', name='Previsione',
+                line=dict(color='red', dash='dash')
+            ))
+            
+            # Intervallo di confidenza
+            fig.add_trace(go.Scatter(
+                x=future_only['ds'], y=future_only['yhat_upper'],
+                fill=None, mode='lines', line_color='rgba(0,0,0,0)',
+                showlegend=False
+            ))
+            fig.add_trace(go.Scatter(
+                x=future_only['ds'], y=future_only['yhat_lower'],
+                fill='tonexty', mode='lines', line_color='rgba(0,0,0,0)',
+                name='Intervallo di confidenza', fillcolor='rgba(255,0,0,0.2)'
+            ))
+            
+            fig.update_layout(
+                title=f"Previsione {metric_col} per {period_name}",
+                xaxis_title="Data",
+                yaxis_title=metric_col
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Statistiche previsione
+            total_forecast = future_only['yhat'].sum()
+            st.metric("Totale Previsto", f"{total_forecast:,.0f}")
+            
+        except Exception as e:
+            st.error(f"Errore nel forecasting: {e}")
 
-        elif analysis == "distribution":
-            col = df.columns[0]
-            counts = df[col].value_counts().head(10)
-            st.bar_chart(counts)
-            st.markdown(f"Distribution of **{col}** (top 10)")
-
-        elif analysis == "correlation":
-            # Seleziona solo colonne numeriche
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            if len(numeric_cols) > 1:
-                corr = df[numeric_cols].corr()
-                st.markdown("### Correlation Matrix")
-                st.dataframe(corr)
-            else:
-                st.warning("Non ci sono abbastanza colonne numeriche per calcolare la correlazione")
-
-        elif analysis == "forecast":
-            if len(df.columns) >= 2:
-                try:
-                    # Gestisci forecast multi-dimensionale (per città, canale, etc.)
-                    if len(df.columns) == 3:  # data, dimensione, valore
-                        st.markdown("### Multi-dimensional Forecast")
-                        
-                        # Ordina per data
-                        df_sorted = df.sort_values(df.columns[0])
-                        
-                        # Ottieni le dimensioni uniche (es. città)
-                        dimension_col = df.columns[1]
-                        value_col = df.columns[2]
-                        dimensions = df_sorted[dimension_col].unique()
-                        
-                        # Limita a top 5 dimensioni per performance
-                        if len(dimensions) > 5:
-                            top_dimensions = df_sorted.groupby(dimension_col)[value_col].sum().nlargest(5).index
-                            df_sorted = df_sorted[df_sorted[dimension_col].isin(top_dimensions)]
-                            dimensions = top_dimensions
-                        
-                        st.markdown(f"### Historical Data by {dimension_col}")
-                        
-                        # Crea un chart per dimensione
-                        forecasts = {}
-                        for dim in dimensions:
-                            dim_data = df_sorted[df_sorted[dimension_col] == dim]
-                            if len(dim_data) >= 10:  # Minimo dati per forecast
-                                ds = pd.to_datetime(dim_data.iloc[:, 0])
-                                y = dim_data.iloc[:, 2].astype(float)
-                                df_ts = pd.DataFrame({"ds": ds, "y": y})
-                                
-                                # Mostra dati storici
-                                st.write(f"**{dim}** - Historical trend:")
-                                st.line_chart(df_ts.set_index("ds"))
-                                
-                                # Forecast
-                                try:
-                                    model = Prophet(
-                                        daily_seasonality=True,
-                                        weekly_seasonality=True,
-                                        yearly_seasonality=False
-                                    )
-                                    model.fit(df_ts)
-                                    
-                                    # Determina periodo
-                                    if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
-                                        from datetime import datetime
-                                        end_of_2025 = datetime(2025, 12, 31)
-                                        today = datetime.now()
-                                        forecast_periods = max(1, (end_of_2025 - today).days)
-                                    elif 'month' in user_query.lower():
-                                        forecast_periods = 30
-                                    elif 'week' in user_query.lower():
-                                        forecast_periods = 7
-                                    else:
-                                        forecast_periods = 30
-                                    
-                                    future = model.make_future_dataframe(periods=forecast_periods)
-                                    forecast = model.predict(future)
-                                    
-                                    # Salva forecast per summary
-                                    future_only = forecast.tail(forecast_periods)
-                                    forecasts[dim] = future_only["yhat"].sum()
-                                    
-                                    # Mostra forecast
-                                    st.write(f"**{dim}** - Forecast:")
-                                    st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])
-                                    
-                                except Exception as e:
-                                    st.warning(f"Errore nel forecast per {dim}: {e}")
-                        
-                        # Summary finale
-                        if forecasts:
-                            st.markdown("### 📊 Forecast Summary")
-                            summary_df = pd.DataFrame(list(forecasts.items()), 
-                                                    columns=[dimension_col, "Predicted_Total"])
-                            summary_df = summary_df.sort_values("Predicted_Total", ascending=False)
-                            st.dataframe(summary_df)
-                            
-                            total_all = summary_df["Predicted_Total"].sum()
-                            st.metric("Total Predicted", f"{total_all:,.0f}")
-                    
-                    else:
-                        # Forecast semplice (data, valore)
-                        df_sorted = df.sort_values(df.columns[0])
-                        
-                        # Converte la prima colonna in datetime
-                        ds = pd.to_datetime(df_sorted.iloc[:, 0])
-                        y = df_sorted.iloc[:, 1].astype(float)
-                        
-                        # Crea DataFrame per Prophet
-                        df_ts = pd.DataFrame({"ds": ds, "y": y})
-                        
-                        st.markdown("### Historical Data")
-                        st.line_chart(df_ts.set_index("ds"))
-                        
-                        # Verifica che ci siano abbastanza dati
-                        if len(df_ts) < 10:
-                            st.warning("Non ci sono abbastanza dati storici per un forecast accurato")
-                            st.dataframe(df_ts)
-                            return
-                        
-                        # Addestra il modello Prophet
-                        model = Prophet(
-                            daily_seasonality=True,
-                            weekly_seasonality=True,
-                            yearly_seasonality=True if len(df_ts) > 365 else False
-                        )
-                        model.fit(df_ts)
-                        
-                        # Determina il periodo di forecast basato sulla query
-                        if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
-                            # Calcola giorni fino alla fine del 2025
-                            from datetime import datetime
-                            end_of_2025 = datetime(2025, 12, 31)
-                            today = datetime.now()
-                            days_until_end_2025 = (end_of_2025 - today).days
-                            forecast_periods = max(1, days_until_end_2025)
-                            period_name = f"{days_until_end_2025} days (until end of 2025)"
-                        elif 'month' in user_query.lower():
-                            forecast_periods = 30
-                            period_name = "30 days (next month)"
-                        elif 'week' in user_query.lower():
-                            forecast_periods = 7
-                            period_name = "7 days (next week)"
-                        elif 'year' in user_query.lower():
-                            forecast_periods = 365
-                            period_name = "365 days (next year)"
-                        else:
-                            forecast_periods = 30
-                            period_name = "30 days"
-                        
-                        # Genera forecast
-                        future = model.make_future_dataframe(periods=forecast_periods)
-                        forecast = model.predict(future)
-                        
-                        # Mostra forecast
-                        st.markdown(f"### Forecast for {period_name}")
-                        forecast_chart = forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]]
-                        st.line_chart(forecast_chart)
-                        
-                        # Mostra le predizioni future
-                        future_forecast = forecast.tail(forecast_periods)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-                        future_forecast.columns = ["Date", "Predicted", "Lower_Bound", "Upper_Bound"]
-                        st.markdown("### Future Predictions")
-                        st.dataframe(future_forecast)
-                        
-                        # Calcola totale previsto
-                        total_predicted = future_forecast["Predicted"].sum()
-                        st.markdown(f"### Summary")
-                        st.metric("Total Predicted Orders", f"{total_predicted:,.0f}")
-                        
-                        # Messaggio specifico per fine 2025
-                        if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
-                            st.info(f"📊 Based on historical trends, you're predicted to make **{total_predicted:,.0f}** orders until the end of 2025!")
-                        
-                except Exception as e:
-                    st.error(f"Errore nel forecasting: {e}")
-                    st.markdown("### Raw Data")
-                    st.dataframe(df)
-            else:
-                st.warning("Servono almeno 2 colonne per il forecasting")
-                st.dataframe(df)
-
-        elif analysis == "raw":
-            st.markdown("### Raw Data")
-            st.dataframe(df)
-
-        else:  # summary
-            st.markdown("### Summary (top 10 rows)")
-            st.dataframe(df.head(10))
-            st.markdown(f"Found **{len(df)}** rows total.")
+    def process_question(self, question: str):
+        """Processa una domanda dall'inizio alla fine"""
+        
+        # 1. Analizza la domanda
+        analysis_type = self.analyze_question(question)
+        
+        # 2. Genera SQL
+        with st.spinner("🔍 Generando query SQL..."):
+            sql = self.generate_sql(question, analysis_type)
+        
+        # 3. Mostra SQL generato
+        with st.expander("🔧 SQL Generato", expanded=False):
+            st.code(sql, language="sql")
+        
+        # 4. Esegui query
+        with st.spinner("⚡ Eseguendo query..."):
+            df = self.execute_sql(sql)
+        
+        if df is None or df.empty:
+            st.error("❌ Nessun risultato trovato")
+            return
+        
+        # 5. Mostra risultati
+        st.subheader("📊 Risultati")
+        st.dataframe(df)
+        
+        # 6. Crea visualizzazioni
+        self.create_visualization(df, question)
+        
+        # 7. Esegui forecast se necessario
+        if analysis_type['is_forecasting']:
+            self.run_forecast(df, question)
+        
+        # 8. Genera insights
+        with st.spinner("🧠 Generando insights..."):
+            insights = self.generate_insights(df, question, analysis_type)
+        
+        st.subheader("💡 Insights")
+        st.markdown(insights)
 
 
 def main():
-    st.title("🔍 NL Analytics & Investment Advisor")
+    st.title("🤖 Smart Analytics Assistant")
+    st.markdown("*Fai qualsiasi domanda sui tuoi dati - risponderò con analisi e previsioni intelligenti*")
     
-    # Mostra info sulla configurazione
-    with st.expander("ℹ️ Configuration Info"):
-        st.write("Per debug, scrivi 'debug' e premi Run")
+    # Esempi di domande
+    with st.expander("💭 Esempi di domande che puoi fare"):
+        st.markdown("""
+        **Analisi Descrittive:**
+        - Quanti ordini ho fatto questo mese?
+        - Chi è il cliente che spende di più?
+        - Qual è la città con più ordini?
+        - Come va il canale online vs offline?
+        
+        **Analisi Temporali:**
+        - Mostrami il trend degli ordini negli ultimi 6 mesi
+        - Qual è la stagionalità delle vendite?
+        - Come cresce il revenue nel tempo?
+        
+        **Previsioni e Strategia:**
+        - In quale città dovrei investire e perché?
+        - Quanti ordini farò il prossimo mese?
+        - Quale canale ha più potenziale?
+        - Dammi una strategia per aumentare le vendite
+        """)
     
-    user_query = st.text_input("Ask anything (analytics/statistics/forecast/invest)...")
-    if st.button("Run"):
-        if user_query:
-            st.session_state.query_history.append(user_query)
-            with st.spinner("Processing your request…"):
-                engine = NL2AnalyticsEngine()
-                engine.run(user_query)
+    # Input principale
+    question = st.text_input(
+        "💬 Fai la tua domanda:",
+        placeholder="es. Quanti ordini ho fatto questo mese?"
+    )
+    
+    if st.button("🚀 Analizza", type="primary"):
+        if question:
+            st.session_state.query_history.append(question)
+            
+            engine = SmartAnalyticsEngine()
+            engine.process_question(question)
         else:
-            st.warning("Inserisci una domanda!")
-
-    if st.session_state.query_history:
-        st.sidebar.header("Recent Queries")
-        for q in st.session_state.query_history[-5:]:
-            st.sidebar.write(f"- {q}")
+            st.warning("⚠️ Inserisci una domanda!")
+    
+    # Sidebar con cronologia e esempi
+    with st.sidebar:
+        st.header("📝 Cronologia")
+        if st.session_state.query_history:
+            for i, q in enumerate(reversed(st.session_state.query_history[-5:])):
+                if st.button(f"🔄 {q[:40]}...", key=f"history_{i}"):
+                    engine = SmartAnalyticsEngine()
+                    engine.process_question(q)
+        else:
+            st.write("*Nessuna query ancora*")
+        
+        st.divider()
+        
+        # Esempi di domande analitiche
+        st.header("📊 Domande Analitiche")
+        st.write("*Clicca per usare come esempio*")
+        
+        analytical_questions = [
+            "Quanti ordini ho fatto questo mese?",
+            "Chi è il cliente che spende di più?",
+            "Qual è la città con più ordini?",
+            "Quale canale performa meglio?",
+            "Mostrami il revenue per paese",
+            "Qual è l'ordine medio per città?",
+            "Chi sono i top 10 clienti per spesa?",
+            "Quanti ordini per canale questo anno?",
+            "Qual è la distribuzione geografica delle vendite?",
+            "Mostrami le statistiche di questo trimestre"
+        ]
+        
+        for q in analytical_questions:
+            if st.button(q, key=f"analytical_{q[:20]}", use_container_width=True):
+                engine = SmartAnalyticsEngine()
+                engine.process_question(q)
+        
+        st.divider()
+        
+        # Esempi di domande predittive
+        st.header("🔮 Domande Predittive")
+        st.write("*Strategie e previsioni*")
+        
+        forecasting_questions = [
+            "In quale città dovrei investire e perché?",
+            "Quanti ordini farò il prossimo mese?",
+            "Quale canale ha più potenziale futuro?",
+            "Dammi previsioni di revenue per dicembre",
+            "Dove dovrei aprire il prossimo negozio?",
+            "Quale strategia per aumentare le vendite?",
+            "Prevedi il trend dei prossimi 3 mesi",
+            "Su quale paese dovrei concentrarmi?",
+            "Raccomandazioni per il Q4 2025",
+            "Analisi predittiva per fine anno"
+        ]
+        
+        for q in forecasting_questions:
+            if st.button(q, key=f"forecasting_{q[:20]}", use_container_width=True):
+                engine = SmartAnalyticsEngine()
+                engine.process_question(q)
 
 if __name__ == "__main__":
     main()
