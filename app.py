@@ -32,7 +32,7 @@ class NL2AnalyticsEngine:
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
         )
-        # Inizializza senza specificare location
+        # Inizializza il client BigQuery
         self.bq = bigquery.Client(project=self.project_id, credentials=creds)
         self.oa = OpenAI(api_key=st.secrets["openai_api_key"])
 
@@ -111,12 +111,8 @@ class NL2AnalyticsEngine:
     def execute_query(self, sql: str):
         """Esegue la query con gestione errori migliorata"""
         try:
-            # Configura il job con la location corretta se disponibile
-            job_config = bigquery.QueryJobConfig()
-            if self.dataset_location:
-                job_config.location = self.dataset_location
-            
-            job = self.bq.query(sql, job_config=job_config)
+            # Esegui la query direttamente senza specificare location nel job config
+            job = self.bq.query(sql)
             return job.result().to_dataframe()
             
         except BadRequest as e:
@@ -142,7 +138,7 @@ class NL2AnalyticsEngine:
                     
                     # Riprova con SQL corretto
                     try:
-                        job = self.bq.query(sql_fixed, job_config=job_config)
+                        job = self.bq.query(sql_fixed)
                         return job.result().to_dataframe()
                     except Exception as e2:
                         st.error(f"Errore con SQL corretto: {e2}")
