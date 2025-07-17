@@ -119,25 +119,32 @@ class NL2AnalyticsEngine:
     def generate_forecast_sql(self, nl: str) -> str:
         """Genera SQL specifico per raccogliere dati storici per forecasting"""
         prompt = (
-            f"You are a BigQuery SQL expert. The user wants to forecast: \"{nl}\"\n\n"
-            f"Generate SQL to get HISTORICAL DATA for forecasting from table {self.full_table_name}.\n\n"
-            f"IMPORTANT: \n"
-            f"- Do NOT try to predict future data in SQL\n"
-            f"- Return historical data that can be used for time series forecasting\n"
-            f"- Use DATE(order_date_timestamp) for date grouping\n"
-            f"- Order by date ASC for time series\n"
-            f"- Common patterns:\n"
-            f"  * Daily orders: SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders\n"
-            f"  * Monthly orders: SELECT DATE_TRUNC(DATE(order_date_timestamp), MONTH) as month, COUNT(*) as orders\n"
-            f"  * Weekly orders: SELECT DATE_TRUNC(DATE(order_date_timestamp), WEEK) as week, COUNT(*) as orders\n\n"
+            f"The user wants to forecast: \"{nl}\"\n\n"
+            f"Generate SQL to get HISTORICAL TIME SERIES DATA from {self.full_table_name}.\n\n"
+            f"CRITICAL RULES:\n"
+            f"- DO NOT try to predict future data in SQL - only get historical data\n"
+            f"- ALWAYS use ORDER BY date ASC for time series\n"
+            f"- Use DATE(order_date_timestamp) for daily data\n"
+            f"- Focus on getting historical patterns that can be used for forecasting\n\n"
+            f"EXAMPLES:\n"
+            f"- For 'forecast next month orders': \n"
+            f"  SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
+            f"  FROM {self.full_table_name} \n"
+            f"  GROUP BY DATE(order_date_timestamp) \n"
+            f"  ORDER BY date ASC\n\n"
+            f"- For 'forecast revenue': \n"
+            f"  SELECT DATE(order_date_timestamp) as date, SUM(total_eur) as revenue \n"
+            f"  FROM {self.full_table_name} \n"
+            f"  GROUP BY DATE(order_date_timestamp) \n"
+            f"  ORDER BY date ASC\n\n"
             f"Available columns: {', '.join(self.schema.keys())}\n"
-            f"Focus on historical trends that can be extrapolated."
+            f"Generate ONLY the SQL, no explanations."
         )
         
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "BigQuery SQL expert for time series data preparation"},
+                {"role": "system", "content": "SQL expert specialized in time series data preparation"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
