@@ -121,30 +121,37 @@ class NL2AnalyticsEngine:
         prompt = (
             f"The user wants to forecast: \"{nl}\"\n\n"
             f"Generate SQL to get HISTORICAL TIME SERIES DATA from {self.full_table_name}.\n\n"
-            f"CRITICAL RULES:\n"
-            f"- DO NOT try to predict future data in SQL - only get historical data\n"
-            f"- ALWAYS use ORDER BY date ASC for time series\n"
-            f"- Use DATE(order_date_timestamp) for daily data\n"
-            f"- Focus on getting historical patterns that can be used for forecasting\n\n"
+            f"⚠️ CRITICAL: NEVER use future dates or WHERE conditions that look for future data!\n"
+            f"📊 ALWAYS get historical data to train a forecasting model\n\n"
+            f"RULES:\n"
+            f"- Get ALL historical data available\n"
+            f"- Use DATE(order_date_timestamp) for daily aggregation\n"
+            f"- ALWAYS ORDER BY date ASC for time series\n"
+            f"- If user mentions 'by city' or location, group by both date AND city\n\n"
             f"EXAMPLES:\n"
-            f"- For 'forecast next month orders': \n"
-            f"  SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
-            f"  FROM {self.full_table_name} \n"
-            f"  GROUP BY DATE(order_date_timestamp) \n"
-            f"  ORDER BY date ASC\n\n"
-            f"- For 'forecast revenue': \n"
-            f"  SELECT DATE(order_date_timestamp) as date, SUM(total_eur) as revenue \n"
-            f"  FROM {self.full_table_name} \n"
-            f"  GROUP BY DATE(order_date_timestamp) \n"
-            f"  ORDER BY date ASC\n\n"
-            f"Available columns: {', '.join(self.schema.keys())}\n"
-            f"Generate ONLY the SQL, no explanations."
+            f"📈 'forecast next month orders' → \n"
+            f"SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
+            f"FROM {self.full_table_name} \n"
+            f"GROUP BY DATE(order_date_timestamp) \n"
+            f"ORDER BY date ASC\n\n"
+            f"🏙️ 'forecast next month orders by city' → \n"
+            f"SELECT DATE(order_date_timestamp) as date, city, COUNT(*) as orders \n"
+            f"FROM {self.full_table_name} \n"
+            f"GROUP BY DATE(order_date_timestamp), city \n"
+            f"ORDER BY date ASC, city\n\n"
+            f"💰 'forecast revenue by channel' → \n"
+            f"SELECT DATE(order_date_timestamp) as date, channel, SUM(total_eur) as revenue \n"
+            f"FROM {self.full_table_name} \n"
+            f"GROUP BY DATE(order_date_timestamp), channel \n"
+            f"ORDER BY date ASC, channel\n\n"
+            f"Available columns: {', '.join(self.schema.keys())}\n\n"
+            f"🎯 Generate ONLY the SQL for HISTORICAL data, no explanations."
         )
         
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "SQL expert specialized in time series data preparation"},
+                {"role": "system", "content": "SQL expert: Generate ONLY historical data queries for forecasting, NEVER future data"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
@@ -382,67 +389,143 @@ class NL2AnalyticsEngine:
         elif analysis == "forecast":
             if len(df.columns) >= 2:
                 try:
-                    # Assicurati che i dati siano ordinati per data
-                    df_sorted = df.sort_values(df.columns[0])
+                    # Gestisci forecast multi-dimensionale (per città, canale, etc.)
+                    if len(df.columns) == 3:  # data, dimensione, valore
+                        st.markdown("### Multi-dimensional Forecast")
+                        
+                        # Ordina per data
+                        df_sorted = df.sort_values(df.columns[0])
+                        
+                        # Ottieni le dimensioni uniche (es. città)
+                        dimension_col = df.columns[1]
+                        value_col = df.columns[2]
+                        dimensions = df_sorted[dimension_col].unique()
+                        
+                        # Limita a top 5 dimensioni per performance
+                        if len(dimensions) > 5:
+                            top_dimensions = df_sorted.groupby(dimension_col)[value_col].sum().nlargest(5).index
+                            df_sorted = df_sorted[df_sorted[dimension_col].isin(top_dimensions)]
+                            dimensions = top_dimensions
+                        
+                        st.markdown(f"### Historical Data by {dimension_col}")
+                        
+                        # Crea un chart per dimensione
+                        forecasts = {}
+                        for dim in dimensions:
+                            dim_data = df_sorted[df_sorted[dimension_col] == dim]
+                            if len(dim_data) >= 10:  # Minimo dati per forecast
+                                ds = pd.to_datetime(dim_data.iloc[:, 0])
+                                y = dim_data.iloc[:, 2].astype(float)
+                                df_ts = pd.DataFrame({"ds": ds, "y": y})
+                                
+                                # Mostra dati storici
+                                st.write(f"**{dim}** - Historical trend:")
+                                st.line_chart(df_ts.set_index("ds"))
+                                
+                                # Forecast
+                                try:
+                                    model = Prophet(
+                                        daily_seasonality=True,
+                                        weekly_seasonality=True,
+                                        yearly_seasonality=False
+                                    )
+                                    model.fit(df_ts)
+                                    
+                                    # Determina periodo
+                                    if 'month' in user_query.lower():
+                                        forecast_periods = 30
+                                    elif 'week' in user_query.lower():
+                                        forecast_periods = 7
+                                    else:
+                                        forecast_periods = 30
+                                    
+                                    future = model.make_future_dataframe(periods=forecast_periods)
+                                    forecast = model.predict(future)
+                                    
+                                    # Salva forecast per summary
+                                    future_only = forecast.tail(forecast_periods)
+                                    forecasts[dim] = future_only["yhat"].sum()
+                                    
+                                    # Mostra forecast
+                                    st.write(f"**{dim}** - Forecast:")
+                                    st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])
+                                    
+                                except Exception as e:
+                                    st.warning(f"Errore nel forecast per {dim}: {e}")
+                        
+                        # Summary finale
+                        if forecasts:
+                            st.markdown("### 📊 Forecast Summary")
+                            summary_df = pd.DataFrame(list(forecasts.items()), 
+                                                    columns=[dimension_col, "Predicted_Total"])
+                            summary_df = summary_df.sort_values("Predicted_Total", ascending=False)
+                            st.dataframe(summary_df)
+                            
+                            total_all = summary_df["Predicted_Total"].sum()
+                            st.metric("Total Predicted", f"{total_all:,.0f}")
                     
-                    # Converte la prima colonna in datetime
-                    ds = pd.to_datetime(df_sorted.iloc[:, 0])
-                    y = df_sorted.iloc[:, 1].astype(float)
-                    
-                    # Crea DataFrame per Prophet
-                    df_ts = pd.DataFrame({"ds": ds, "y": y})
-                    
-                    st.markdown("### Historical Data")
-                    st.line_chart(df_ts.set_index("ds"))
-                    
-                    # Verifica che ci siano abbastanza dati
-                    if len(df_ts) < 10:
-                        st.warning("Non ci sono abbastanza dati storici per un forecast accurato")
-                        st.dataframe(df_ts)
-                        return
-                    
-                    # Addestra il modello Prophet
-                    model = Prophet(
-                        daily_seasonality=True,
-                        weekly_seasonality=True,
-                        yearly_seasonality=True if len(df_ts) > 365 else False
-                    )
-                    model.fit(df_ts)
-                    
-                    # Determina il periodo di forecast basato sulla query
-                    if 'month' in user_query.lower():
-                        forecast_periods = 30
-                        period_name = "30 days (next month)"
-                    elif 'week' in user_query.lower():
-                        forecast_periods = 7
-                        period_name = "7 days (next week)"
-                    elif 'year' in user_query.lower():
-                        forecast_periods = 365
-                        period_name = "365 days (next year)"
                     else:
-                        forecast_periods = 30
-                        period_name = "30 days"
-                    
-                    # Genera forecast
-                    future = model.make_future_dataframe(periods=forecast_periods)
-                    forecast = model.predict(future)
-                    
-                    # Mostra forecast
-                    st.markdown(f"### Forecast for {period_name}")
-                    forecast_chart = forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]]
-                    st.line_chart(forecast_chart)
-                    
-                    # Mostra le predizioni future
-                    future_forecast = forecast.tail(forecast_periods)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-                    future_forecast.columns = ["Date", "Predicted", "Lower_Bound", "Upper_Bound"]
-                    st.markdown("### Future Predictions")
-                    st.dataframe(future_forecast)
-                    
-                    # Calcola totale previsto
-                    total_predicted = future_forecast["Predicted"].sum()
-                    st.markdown(f"### Summary")
-                    st.metric("Total Predicted Orders", f"{total_predicted:,.0f}")
-                    
+                        # Forecast semplice (data, valore)
+                        df_sorted = df.sort_values(df.columns[0])
+                        
+                        # Converte la prima colonna in datetime
+                        ds = pd.to_datetime(df_sorted.iloc[:, 0])
+                        y = df_sorted.iloc[:, 1].astype(float)
+                        
+                        # Crea DataFrame per Prophet
+                        df_ts = pd.DataFrame({"ds": ds, "y": y})
+                        
+                        st.markdown("### Historical Data")
+                        st.line_chart(df_ts.set_index("ds"))
+                        
+                        # Verifica che ci siano abbastanza dati
+                        if len(df_ts) < 10:
+                            st.warning("Non ci sono abbastanza dati storici per un forecast accurato")
+                            st.dataframe(df_ts)
+                            return
+                        
+                        # Addestra il modello Prophet
+                        model = Prophet(
+                            daily_seasonality=True,
+                            weekly_seasonality=True,
+                            yearly_seasonality=True if len(df_ts) > 365 else False
+                        )
+                        model.fit(df_ts)
+                        
+                        # Determina il periodo di forecast basato sulla query
+                        if 'month' in user_query.lower():
+                            forecast_periods = 30
+                            period_name = "30 days (next month)"
+                        elif 'week' in user_query.lower():
+                            forecast_periods = 7
+                            period_name = "7 days (next week)"
+                        elif 'year' in user_query.lower():
+                            forecast_periods = 365
+                            period_name = "365 days (next year)"
+                        else:
+                            forecast_periods = 30
+                            period_name = "30 days"
+                        
+                        # Genera forecast
+                        future = model.make_future_dataframe(periods=forecast_periods)
+                        forecast = model.predict(future)
+                        
+                        # Mostra forecast
+                        st.markdown(f"### Forecast for {period_name}")
+                        forecast_chart = forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]]
+                        st.line_chart(forecast_chart)
+                        
+                        # Mostra le predizioni future
+                        future_forecast = forecast.tail(forecast_periods)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+                        future_forecast.columns = ["Date", "Predicted", "Lower_Bound", "Upper_Bound"]
+                        st.markdown("### Future Predictions")
+                        st.dataframe(future_forecast)
+                        
+                        # Calcola totale previsto
+                        total_predicted = future_forecast["Predicted"].sum()
+                        st.markdown(f"### Summary")
+                        st.metric("Total Predicted Orders", f"{total_predicted:,.0f}")
+                        
                 except Exception as e:
                     st.error(f"Errore nel forecasting: {e}")
                     st.markdown("### Raw Data")
