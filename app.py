@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from google.api_core.exceptions import BadRequest, NotFound
@@ -25,9 +26,31 @@ class NL2AnalyticsEngine:
         self.bq = None
         self.oa = None
         self.dataset_location = None
+        self.schema = self._get_table_schema()
         self._setup_clients()
         self._verify_dataset_access()
 
+    def _get_table_schema(self):
+        """Restituisce lo schema della tabella con i tipi di dato"""
+        return {
+            "unique_id": "STRING",
+            "order_id": "STRING", 
+            "channel": "STRING",
+            "order_date_timestamp": "TIMESTAMP",
+            "full_name": "STRING",
+            "street": "STRING", 
+            "house_no": "STRING",
+            "postal_code": "STRING",
+            "city": "STRING",
+            "country_code": "STRING",
+            "email": "STRING",
+            "total_eur": "FLOAT",
+            "customer_id": "STRING",
+            "latitude": "FLOAT",
+            "longitude": "FLOAT",
+            "inserted_at": "TIMESTAMP"
+        }
+    
     def _setup_clients(self):
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
@@ -79,7 +102,7 @@ class NL2AnalyticsEngine:
         system_prompt = (
             "You are an analytics assistant. "
             "Classify the user's request into exactly one of: "
-            "top_n, distribution, correlation, forecast, raw, summary, recommendation."
+            "top_n, distribution, correlation, forecast, raw, summary, recommendation, investment_analysis."
         )
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -92,15 +115,30 @@ class NL2AnalyticsEngine:
         return response.choices[0].message.content.strip().lower()
 
     def generate_sql(self, nl: str) -> str:
+        # Crea la descrizione delle colonne per il prompt
+        columns_info = []
+        for col_name, col_type in self.schema.items():
+            columns_info.append(f"- {col_name} ({col_type})")
+        
+        columns_desc = "\n".join(columns_info)
+        
         prompt = (
-            f"You are a BigQuery SQL expert. Given the request:\n\"{nl}\"\n"
-            f"Generate only the SQL (no explanations) on table {self.full_table_name}.\n"
-            f"Available columns likely include: order_id, channel, order_date, city, country_code, total_eur, customer_id"
+            f"You are a BigQuery SQL expert. Given the request:\n\"{nl}\"\n\n"
+            f"Generate only the SQL (no explanations) on table {self.full_table_name}.\n\n"
+            f"IMPORTANT: Use EXACTLY these column names:\n{columns_desc}\n\n"
+            f"Common mappings:\n"
+            f"- For dates/time: use 'order_date_timestamp' (TIMESTAMP)\n"
+            f"- For order value/amount/price: use 'total_eur' (FLOAT)\n"
+            f"- For customer/user: use 'customer_id' (STRING)\n"
+            f"- For sales channel: use 'channel' (STRING)\n"
+            f"- For location: use 'city' and 'country_code'\n\n"
+            f"When working with timestamps, use DATE() function to extract date portion if needed."
         )
+        
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "SQL expert"},
+                {"role": "system", "content": "BigQuery SQL expert with exact schema knowledge"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
@@ -123,11 +161,18 @@ class NL2AnalyticsEngine:
             if m:
                 bad_col = m.group(1)
                 col_map = {
+                    "order_date": "order_date_timestamp",
+                    "date": "order_date_timestamp", 
+                    "order_time": "order_date_timestamp",
+                    "timestamp": "order_date_timestamp",
                     "total_amount": "total_eur",
                     "amount": "total_eur",
                     "spend": "total_eur",
                     "price": "total_eur",
-                    "user_id": "customer_id"
+                    "revenue": "total_eur",
+                    "sales": "total_eur",
+                    "user_id": "customer_id",
+                    "customer": "customer_id"
                 }
                 if bad_col in col_map:
                     corrected = col_map[bad_col]
@@ -145,6 +190,9 @@ class NL2AnalyticsEngine:
                         return None
                 else:
                     st.error(f"Colonna `{bad_col}` non riconosciuta e non mappata")
+                    # Mostra le colonne disponibili
+                    available_cols = list(self.schema.keys())
+                    st.info(f"Colonne disponibili: {', '.join(available_cols)}")
                     return None
             else:
                 st.error(f"Errore SQL: {msg}")
@@ -216,11 +264,16 @@ class NL2AnalyticsEngine:
 
         # Altri tipi di analisi...
         if analysis == "top_n":
-            c1, c2 = df.columns[:2]
-            lines = [f"Top results by {c2}:"]
-            for idx, row in df.iterrows():
-                lines.append(f"{idx+1}. {row[c1]} → {row[c2]:,.0f}")
-            st.markdown("\n".join(lines))
+            if len(df.columns) >= 2:
+                c1, c2 = df.columns[:2]
+                lines = [f"Top results by {c2}:"]
+                for idx, row in df.iterrows():
+                    if idx >= 10:  # Limita a 10 risultati
+                        break
+                    lines.append(f"{idx+1}. {row[c1]} → {row[c2]:,.0f}")
+                st.markdown("\n".join(lines))
+            else:
+                st.dataframe(df)
 
         elif analysis == "distribution":
             col = df.columns[0]
@@ -229,52 +282,108 @@ class NL2AnalyticsEngine:
             st.markdown(f"Distribution of **{col}** (top 10)")
 
         elif analysis == "correlation":
-            corr = df.corr()
-            st.markdown("### Correlation Matrix")
-            st.dataframe(corr)
+            # Seleziona solo colonne numeriche
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 1:
+                corr = df[numeric_cols].corr()
+                st.markdown("### Correlation Matrix")
+                st.dataframe(corr)
+            else:
+                st.warning("Non ci sono abbastanza colonne numeriche per calcolare la correlazione")
 
         elif analysis == "forecast":
-            ds = pd.to_datetime(df.iloc[:, 0])
-            y = df.iloc[:, 1]
-            df_ts = pd.DataFrame({"ds": ds, "y": y})
-            model = Prophet()
-            model.fit(df_ts)
-            future = model.make_future_dataframe(periods=30)
-            forecast = model.predict(future)
-            st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])  
-            st.markdown("Forecast for next 30 periods")
+            if len(df.columns) >= 2:
+                try:
+                    ds = pd.to_datetime(df.iloc[:, 0])
+                    y = df.iloc[:, 1]
+                    df_ts = pd.DataFrame({"ds": ds, "y": y}).sort_values("ds")
+                    
+                    model = Prophet()
+                    model.fit(df_ts)
+                    future = model.make_future_dataframe(periods=30)
+                    forecast = model.predict(future)
+                    
+                    st.line_chart(forecast.set_index("ds")[["yhat", "yhat_lower", "yhat_upper"]])  
+                    st.markdown("### Forecast for next 30 periods")
+                    
+                    # Mostra anche i dati storici
+                    st.line_chart(df_ts.set_index("ds"))
+                    st.markdown("### Historical Data")
+                except Exception as e:
+                    st.error(f"Errore nel forecasting: {e}")
+                    st.markdown("### Raw Data")
+                    st.dataframe(df)
+            else:
+                st.warning("Servono almeno 2 colonne per il forecasting")
 
         elif analysis == "raw":
             st.markdown("### Raw Data")
             st.dataframe(df)
 
         else:  # summary
-            st.markdown("### Summary (top 5 rows)")
-            st.table(df.head(5))
+            st.markdown("### Summary (top 10 rows)")
+            st.dataframe(df.head(10))
             st.markdown(f"Found **{len(df)}** rows total.")
 
 
 def main():
-    st.title("🔍 NL Analytics & Investment Advisor")
+    st.title("🔍 Advanced Analytics & Investment Advisor")
+    st.markdown("*Powered by AI-driven data analysis and predictive insights*")
     
     # Mostra info sulla configurazione
-    with st.expander("ℹ️ Configuration Info"):
-        st.write("Per debug, scrivi 'debug' e premi Run")
+    with st.expander("ℹ️ Available Analysis Types"):
+        st.markdown("""
+        **📊 Standard Analytics:**
+        - Top N results, distributions, correlations
+        - Time series forecasting with Prophet
+        - Raw data exploration and summaries
+        
+        **🎯 Investment Analysis:**
+        - Comprehensive market analysis by city and channel
+        - Customer segmentation and behavior patterns
+        - Seasonal trends and growth predictions
+        - AI-powered investment recommendations
+        
+        **💡 Example Questions:**
+        - "Where should I invest more?" → Full investment analysis
+        - "Show me sales trends by month" → Time series analysis
+        - "Which cities perform best?" → City comparison
+        - "Forecast next month's orders" → Predictive modeling
+        """)
     
-    user_query = st.text_input("Ask anything (analytics/statistics/forecast/invest)...")
-    if st.button("Run"):
+    user_query = st.text_input("Ask anything about your business data...", placeholder="e.g., Where should I invest more?")
+    
+    if st.button("🚀 Analyze", type="primary"):
         if user_query:
             st.session_state.query_history.append(user_query)
-            with st.spinner("Processing your request…"):
+            with st.spinner("🔄 Analyzing your data and generating insights..."):
                 engine = NL2AnalyticsEngine()
                 engine.run(user_query)
         else:
-            st.warning("Inserisci una domanda!")
+            st.warning("Please enter a question!")
 
+    # Sidebar con cronologia e suggerimenti
     if st.session_state.query_history:
-        st.sidebar.header("Recent Queries")
+        st.sidebar.header("📝 Recent Queries")
         for q in st.session_state.query_history[-5:]:
-            st.sidebar.write(f"- {q}")
+            if st.sidebar.button(f"🔄 {q[:30]}...", key=f"rerun_{q}"):
+                engine = NL2AnalyticsEngine()
+                engine.run(q)
+    
+    # Suggerimenti nella sidebar
+    st.sidebar.header("💡 Suggested Analyses")
+    suggestions = [
+        "Where should I invest more?",
+        "Show me monthly sales trends",
+        "Which channels perform best?",
+        "Forecast next month orders",
+        "Customer segmentation analysis"
+    ]
+    
+    for suggestion in suggestions:
+        if st.sidebar.button(f"📊 {suggestion}", key=f"suggest_{suggestion}"):
+            engine = NL2AnalyticsEngine()
+            engine.run(suggestion)
 
 if __name__ == "__main__":
     main()
