@@ -102,7 +102,7 @@ class NL2AnalyticsEngine:
         system_prompt = (
             "You are an analytics assistant. "
             "Classify the user's request into exactly one of: "
-            "top_n, distribution, correlation, forecast, raw, summary, recommendation, investment_analysis."
+            "top_n, distribution, correlation, forecast, raw, summary, recommendation."
         )
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -132,13 +132,25 @@ class NL2AnalyticsEngine:
             f"- For customer/user: use 'customer_id' (STRING)\n"
             f"- For sales channel: use 'channel' (STRING)\n"
             f"- For location: use 'city' and 'country_code'\n\n"
-            f"When working with timestamps, use DATE() function to extract date portion if needed."
+            f"BIGQUERY TIMESTAMP RULES:\n"
+            f"- Use DATE(order_date_timestamp) to extract date from timestamp\n"
+            f"- Use DATETIME(order_date_timestamp) to extract datetime from timestamp\n"
+            f"- For date arithmetic, convert to DATE first: DATE_ADD(DATE(order_date_timestamp), INTERVAL 1 MONTH)\n"
+            f"- Use DATE_SUB() and DATE_ADD() for date operations, NOT TIMESTAMP_ADD with MONTH\n"
+            f"- For time-based filtering: WHERE order_date_timestamp >= '2024-01-01' AND order_date_timestamp < '2024-02-01'\n"
+            f"- For grouping by date: GROUP BY DATE(order_date_timestamp)\n"
+            f"- For extracting year/month: EXTRACT(YEAR FROM order_date_timestamp), EXTRACT(MONTH FROM order_date_timestamp)\n\n"
+            f"Examples:\n"
+            f"- Daily trends: SELECT DATE(order_date_timestamp) as order_date, COUNT(*) FROM table GROUP BY DATE(order_date_timestamp)\n"
+            f"- Monthly trends: SELECT DATE_TRUNC(DATE(order_date_timestamp), MONTH) as month, COUNT(*) FROM table GROUP BY month\n"
+            f"- Last 30 days: WHERE order_date_timestamp >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n"
+            f"- Next month data: WHERE DATE(order_date_timestamp) >= DATE_ADD(CURRENT_DATE(), INTERVAL 1 MONTH)"
         )
         
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "BigQuery SQL expert with exact schema knowledge"},
+                {"role": "system", "content": "BigQuery SQL expert with exact schema and timestamp handling knowledge"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
@@ -193,6 +205,45 @@ class NL2AnalyticsEngine:
                     # Mostra le colonne disponibili
                     available_cols = list(self.schema.keys())
                     st.info(f"Colonne disponibili: {', '.join(available_cols)}")
+                    return None
+            
+            # Gestione errori specifici di BigQuery TIMESTAMP
+            elif "TIMESTAMP_ADD does not support the MONTH date part" in msg:
+                st.warning("Errore TIMESTAMP_ADD con MONTH - correggo con DATE_ADD")
+                # Sostituisci TIMESTAMP_ADD con DATE_ADD e converti a DATE
+                sql_fixed = re.sub(
+                    r'TIMESTAMP_ADD\s*\(\s*([^,]+),\s*INTERVAL\s+(\d+)\s+MONTH\s*\)',
+                    r'DATE_ADD(DATE(\1), INTERVAL \2 MONTH)',
+                    sql,
+                    flags=re.IGNORECASE
+                )
+                st.markdown("### SQL Corretto")
+                st.code(sql_fixed, language="sql")
+                
+                try:
+                    job = self.bq.query(sql_fixed)
+                    return job.result().to_dataframe()
+                except Exception as e2:
+                    st.error(f"Errore con SQL corretto: {e2}")
+                    return None
+                    
+            elif "does not support the MONTH date part when the argument is TIMESTAMP type" in msg:
+                st.warning("Errore operazione MONTH su TIMESTAMP - correggo convertendo a DATE")
+                # Trova e correggi operazioni di data su timestamp
+                sql_fixed = re.sub(
+                    r'([A-Z_]+)\s*\(\s*(order_date_timestamp),\s*INTERVAL\s+(\d+)\s+MONTH\s*\)',
+                    r'\1(DATE(\2), INTERVAL \3 MONTH)',
+                    sql,
+                    flags=re.IGNORECASE
+                )
+                st.markdown("### SQL Corretto")
+                st.code(sql_fixed, language="sql")
+                
+                try:
+                    job = self.bq.query(sql_fixed)
+                    return job.result().to_dataframe()
+                except Exception as e2:
+                    st.error(f"Errore con SQL corretto: {e2}")
                     return None
             else:
                 st.error(f"Errore SQL: {msg}")
@@ -327,63 +378,26 @@ class NL2AnalyticsEngine:
 
 
 def main():
-    st.title("🔍 Advanced Analytics & Investment Advisor")
-    st.markdown("*Powered by AI-driven data analysis and predictive insights*")
+    st.title("🔍 NL Analytics & Investment Advisor")
     
     # Mostra info sulla configurazione
-    with st.expander("ℹ️ Available Analysis Types"):
-        st.markdown("""
-        **📊 Standard Analytics:**
-        - Top N results, distributions, correlations
-        - Time series forecasting with Prophet
-        - Raw data exploration and summaries
-        
-        **🎯 Investment Analysis:**
-        - Comprehensive market analysis by city and channel
-        - Customer segmentation and behavior patterns
-        - Seasonal trends and growth predictions
-        - AI-powered investment recommendations
-        
-        **💡 Example Questions:**
-        - "Where should I invest more?" → Full investment analysis
-        - "Show me sales trends by month" → Time series analysis
-        - "Which cities perform best?" → City comparison
-        - "Forecast next month's orders" → Predictive modeling
-        """)
+    with st.expander("ℹ️ Configuration Info"):
+        st.write("Per debug, scrivi 'debug' e premi Run")
     
-    user_query = st.text_input("Ask anything about your business data...", placeholder="e.g., Where should I invest more?")
-    
-    if st.button("🚀 Analyze", type="primary"):
+    user_query = st.text_input("Ask anything (analytics/statistics/forecast/invest)...")
+    if st.button("Run"):
         if user_query:
             st.session_state.query_history.append(user_query)
-            with st.spinner("🔄 Analyzing your data and generating insights..."):
+            with st.spinner("Processing your request…"):
                 engine = NL2AnalyticsEngine()
                 engine.run(user_query)
         else:
-            st.warning("Please enter a question!")
+            st.warning("Inserisci una domanda!")
 
-    # Sidebar con cronologia e suggerimenti
     if st.session_state.query_history:
-        st.sidebar.header("📝 Recent Queries")
+        st.sidebar.header("Recent Queries")
         for q in st.session_state.query_history[-5:]:
-            if st.sidebar.button(f"🔄 {q[:30]}...", key=f"rerun_{q}"):
-                engine = NL2AnalyticsEngine()
-                engine.run(q)
-    
-    # Suggerimenti nella sidebar
-    st.sidebar.header("💡 Suggested Analyses")
-    suggestions = [
-        "Where should I invest more?",
-        "Show me monthly sales trends",
-        "Which channels perform best?",
-        "Forecast next month orders",
-        "Customer segmentation analysis"
-    ]
-    
-    for suggestion in suggestions:
-        if st.sidebar.button(f"📊 {suggestion}", key=f"suggest_{suggestion}"):
-            engine = NL2AnalyticsEngine()
-            engine.run(suggestion)
+            st.sidebar.write(f"- {q}")
 
 if __name__ == "__main__":
     main()
