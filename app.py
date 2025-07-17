@@ -203,14 +203,24 @@ Genera SOLO il SQL, senza spiegazioni:
                 
                 for num_col in numeric_cols[:2]:  # Max 2 metriche
                     fig = px.line(df_sorted, x=date_col, y=num_col, 
-                                title=f"{num_col.title()} nel tempo")
+                                title=f"📈 {num_col.title()} nel tempo")
+                    fig.update_layout(
+                        xaxis_title="Data",
+                        yaxis_title=num_col.title(),
+                        showlegend=False
+                    )
                     st.plotly_chart(fig, use_container_width=True)
         
         # Grafici per top rankings
         elif len(df.columns) >= 2 and len(df) <= 20:
             if df.dtypes.iloc[1] in ['int64', 'float64']:
                 fig = px.bar(df.head(10), x=df.columns[0], y=df.columns[1],
-                           title=f"Top {df.columns[0]} per {df.columns[1]}")
+                           title=f"📊 Top {df.columns[0]} per {df.columns[1]}")
+                fig.update_layout(
+                    xaxis_title=df.columns[0].title(),
+                    yaxis_title=df.columns[1].title(),
+                    showlegend=False
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
     def generate_insights(self, df: pd.DataFrame, question: str, analysis_type: dict) -> str:
@@ -315,14 +325,15 @@ Rispondi in italiano:
             # Visualizza risultati
             st.subheader("📈 Previsione")
             
-            # Grafico forecast
+            # Grafico forecast con Plotly
             fig = go.Figure()
             
             # Dati storici
             fig.add_trace(go.Scatter(
                 x=prophet_df['ds'], y=prophet_df['y'],
                 mode='lines+markers', name='Dati Storici',
-                line=dict(color='blue')
+                line=dict(color='#1f77b4', width=2),
+                marker=dict(size=4)
             ))
             
             # Previsioni
@@ -330,32 +341,58 @@ Rispondi in italiano:
             fig.add_trace(go.Scatter(
                 x=future_only['ds'], y=future_only['yhat'],
                 mode='lines', name='Previsione',
-                line=dict(color='red', dash='dash')
+                line=dict(color='#ff7f0e', dash='dash', width=3)
             ))
             
             # Intervallo di confidenza
             fig.add_trace(go.Scatter(
                 x=future_only['ds'], y=future_only['yhat_upper'],
                 fill=None, mode='lines', line_color='rgba(0,0,0,0)',
-                showlegend=False
+                showlegend=False, hoverinfo='skip'
             ))
             fig.add_trace(go.Scatter(
                 x=future_only['ds'], y=future_only['yhat_lower'],
                 fill='tonexty', mode='lines', line_color='rgba(0,0,0,0)',
-                name='Intervallo di confidenza', fillcolor='rgba(255,0,0,0.2)'
+                name='Intervallo di confidenza', 
+                fillcolor='rgba(255,127,14,0.2)',
+                hoverinfo='skip'
             ))
             
             fig.update_layout(
-                title=f"Previsione {metric_col} per {period_name}",
+                title=f"🔮 Previsione {metric_col} per {period_name}",
                 xaxis_title="Data",
-                yaxis_title=metric_col
+                yaxis_title=metric_col.title(),
+                hovermode='x unified',
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
             )
             
             st.plotly_chart(fig, use_container_width=True)
             
             # Statistiche previsione
             total_forecast = future_only['yhat'].sum()
-            st.metric("Totale Previsto", f"{total_forecast:,.0f}")
+            avg_forecast = future_only['yhat'].mean()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Totale Previsto", f"{total_forecast:,.0f}")
+            with col2:
+                st.metric("Media Giornaliera", f"{avg_forecast:,.1f}")
+            
+            # Mostra dettagli previsione
+            with st.expander("📋 Dettagli Previsione"):
+                future_display = future_only[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+                future_display.columns = ['Data', 'Previsione', 'Min', 'Max']
+                future_display['Data'] = future_display['Data'].dt.strftime('%Y-%m-%d')
+                future_display['Previsione'] = future_display['Previsione'].round(1)
+                future_display['Min'] = future_display['Min'].round(1)
+                future_display['Max'] = future_display['Max'].round(1)
+                st.dataframe(future_display, use_container_width=True)
             
         except Exception as e:
             st.error(f"Errore nel forecasting: {e}")
