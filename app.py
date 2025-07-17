@@ -123,13 +123,21 @@ class NL2AnalyticsEngine:
             f"Generate SQL to get HISTORICAL TIME SERIES DATA from {self.full_table_name}.\n\n"
             f"⚠️ CRITICAL: NEVER use future dates or WHERE conditions that look for future data!\n"
             f"📊 ALWAYS get historical data to train a forecasting model\n\n"
-            f"RULES:\n"
-            f"- Get ALL historical data available\n"
-            f"- Use DATE(order_date_timestamp) for daily aggregation\n"
+            f"MANDATORY RULES:\n"
+            f"- ALWAYS return at least 2 columns: date and metric\n"
+            f"- Use DATE(order_date_timestamp) as the date column\n"
+            f"- Use COUNT(*) or COUNT(order_id) to count orders per date\n"
+            f"- Use SUM(total_eur) for revenue forecasting\n"
+            f"- ALWAYS GROUP BY the date column\n"
             f"- ALWAYS ORDER BY date ASC for time series\n"
-            f"- If user mentions 'by city' or location, group by both date AND city\n\n"
+            f"- If user mentions 'by city' or location, add city as third column\n\n"
             f"EXAMPLES:\n"
-            f"📈 'forecast next month orders' → \n"
+            f"📈 'forecast orders until end of 2025' → \n"
+            f"SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
+            f"FROM {self.full_table_name} \n"
+            f"GROUP BY DATE(order_date_timestamp) \n"
+            f"ORDER BY date ASC\n\n"
+            f"📈 'how many orders will I make' → \n"
             f"SELECT DATE(order_date_timestamp) as date, COUNT(*) as orders \n"
             f"FROM {self.full_table_name} \n"
             f"GROUP BY DATE(order_date_timestamp) \n"
@@ -145,13 +153,14 @@ class NL2AnalyticsEngine:
             f"GROUP BY DATE(order_date_timestamp), channel \n"
             f"ORDER BY date ASC, channel\n\n"
             f"Available columns: {', '.join(self.schema.keys())}\n\n"
-            f"🎯 Generate ONLY the SQL for HISTORICAL data, no explanations."
+            f"🎯 REMEMBER: Always return DATE + METRIC columns, never just dates!\n"
+            f"Generate ONLY the SQL for HISTORICAL data, no explanations."
         )
         
         response = self.oa.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "SQL expert: Generate ONLY historical data queries for forecasting, NEVER future data"},
+                {"role": "system", "content": "SQL expert: Always return DATE + METRIC columns for time series. Never just dates!"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
@@ -432,7 +441,12 @@ class NL2AnalyticsEngine:
                                     model.fit(df_ts)
                                     
                                     # Determina periodo
-                                    if 'month' in user_query.lower():
+                                    if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
+                                        from datetime import datetime
+                                        end_of_2025 = datetime(2025, 12, 31)
+                                        today = datetime.now()
+                                        forecast_periods = max(1, (end_of_2025 - today).days)
+                                    elif 'month' in user_query.lower():
                                         forecast_periods = 30
                                     elif 'week' in user_query.lower():
                                         forecast_periods = 7
@@ -493,7 +507,15 @@ class NL2AnalyticsEngine:
                         model.fit(df_ts)
                         
                         # Determina il periodo di forecast basato sulla query
-                        if 'month' in user_query.lower():
+                        if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
+                            # Calcola giorni fino alla fine del 2025
+                            from datetime import datetime
+                            end_of_2025 = datetime(2025, 12, 31)
+                            today = datetime.now()
+                            days_until_end_2025 = (end_of_2025 - today).days
+                            forecast_periods = max(1, days_until_end_2025)
+                            period_name = f"{days_until_end_2025} days (until end of 2025)"
+                        elif 'month' in user_query.lower():
                             forecast_periods = 30
                             period_name = "30 days (next month)"
                         elif 'week' in user_query.lower():
@@ -525,6 +547,10 @@ class NL2AnalyticsEngine:
                         total_predicted = future_forecast["Predicted"].sum()
                         st.markdown(f"### Summary")
                         st.metric("Total Predicted Orders", f"{total_predicted:,.0f}")
+                        
+                        # Messaggio specifico per fine 2025
+                        if 'end of 2025' in user_query.lower() or 'until 2025' in user_query.lower():
+                            st.info(f"📊 Based on historical trends, you're predicted to make **{total_predicted:,.0f}** orders until the end of 2025!")
                         
                 except Exception as e:
                     st.error(f"Errore nel forecasting: {e}")
