@@ -20,7 +20,7 @@ if 'query_history' not in st.session_state:
 class NL2AnalyticsEngine:
     def __init__(self):
         self.project_id = st.secrets["project_id"]
-        self.dataset_id = "locatify_data"
+        self.dataset_id = "locatify_dataset_1"
         self.table_id = "brand_orders"
         self.bq = None
         self.oa = None
